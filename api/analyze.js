@@ -1,6 +1,5 @@
-// api/analyze.js — Vision ➜ cleaned pantry (labels + OCR + fuzzy) ➜ Spoonacular ➜ (fallback) OpenAI
-// Env (Vercel → Project → Settings → Environment Variables):
-//  GCV_KEY, SPOON_KEY, OPENAI_API_KEY
+// api/analyze.js — Vision ➜ cleaned pantry (labels + OCR + strict fuzzy) ➜ Spoonacular ➜ (fallback) OpenAI
+// Set env vars in Vercel: GCV_KEY, SPOON_KEY, OPENAI_API_KEY
 
 export default async function handler(req, res) {
   try {
@@ -11,23 +10,21 @@ export default async function handler(req, res) {
     let pantry = [];
 
     if (Array.isArray(pantryOverride) && pantryOverride.length) {
-      // Client provided its current pantry → clean + dedupe here
+      // Client submitted current pantry (e.g., after manual fixes)
       pantry = cleanPantry(pantryOverride.map(String));
     } else {
       if (!imageBase64) return res.status(400).json({ error: "imageBase64 required (or pantryOverride)" });
-
-      // ---- Vision: labels + objects + OCR text ----
-      const vision = await callVision(imageBase64, process.env.GCV_KEY);
-      pantry = cleanPantry(vision);
+      const visionTerms = await callVision(imageBase64, process.env.GCV_KEY);
+      pantry = cleanPantry(visionTerms);
     }
 
-    // ---- Spoonacular first ----
+    // Spoonacular first
     let recipes = [];
     if (process.env.SPOON_KEY && pantry.length) {
       recipes = await findSpoonacularRecipes(pantry, prefs, process.env.SPOON_KEY);
     }
 
-    // ---- Fallback LLM if nothing ----
+    // Fallback to LLM if nothing found
     if ((!recipes || recipes.length === 0) && process.env.OPENAI_API_KEY && pantry.length) {
       const r = await llmRecipe(pantry, prefs, process.env.OPENAI_API_KEY);
       if (r) recipes = [r];
@@ -53,7 +50,7 @@ async function callVision(imageBase64, apiKey) {
       features: [
         { type: "LABEL_DETECTION", maxResults: 50 },
         { type: "OBJECT_LOCALIZATION", maxResults: 50 },
-        { type: "TEXT_DETECTION", maxResults: 1 }, // NEW: OCR
+        { type: "TEXT_DETECTION", maxResults: 1 }, // OCR
       ],
     }],
   };
@@ -71,17 +68,29 @@ async function callVision(imageBase64, apiKey) {
   (r.labelAnnotations || []).forEach((x) => labels.push(x.description));
   (r.localizedObjectAnnotations || []).forEach((x) => labels.push(x.name));
 
-  // OCR tokens
+  // ---------- OCR tokens (aggressive cleanup) ----------
   const ocrRaw = (r.textAnnotations?.[0]?.description || "").toLowerCase();
-  const ocrTokens = ocrRaw
+
+  // split, drop very short tokens, keep plausible “foodish” words only
+  const RAW_TOKENS = ocrRaw
     .split(/[^a-z]+/g)
     .map((t) => t.trim())
-    .filter(Boolean);
+    .filter((t) => t.length >= 4); // ignore tiny tokens like "so", "uk", etc.
+
+  const FOODISH_HINTS = new Set([
+    "ingredients","organic","sauce","soup","canned","tin","dried","fresh","frozen",
+    "beans","peas","lentils","broccoli","banana","tomato","onion","garlic","squash",
+    "chickpea","chickpeas","feta","rice","pasta","olive","seed","seeds","flour",
+    "oats","milk","yogurt","cheese","lemon","pepper","spinach","mushroom","potato",
+  ]);
+
+  // keep token if it looks like food-ish; whitelist matching happens later
+  const ocrTokens = RAW_TOKENS.filter(t => FOODISH_HINTS.has(t));
 
   return uniqLower([...labels, ...ocrTokens]);
 }
 
-/* ------------------- Pantry cleaning (whitelist + synonyms + fuzzy) ------------------- */
+/* ------------------- Pantry cleaning (whitelist + synonyms + strict fuzzy) ------------------- */
 function uniqLower(arr) { const s = new Set(); arr.forEach(a => s.add(String(a||"").trim().toLowerCase())); return [...s]; }
 
 const WHITELIST = [
@@ -92,7 +101,7 @@ const WHITELIST = [
   "chicken","chicken breast","beef","pork","fish","salmon","tuna",
   "bread","tortilla","wrap","beans","kidney beans","black beans","lentils",
   "cucumber","lettuce","cabbage","kale","avocado","apple","orange","pear",
-  "oats","flour","sugar","butter","oil","salt","pepper"
+  "oats","flour","sugar","butter","salt","pepper" // NOTE: generic "oil" removed
 ];
 
 const MAP = {
@@ -106,36 +115,38 @@ const MAP = {
   tomato: "tomatoes",
   onions: "onion",
   eggs: "egg",
-  brockley: "broccoli", // common typo seen in your screenshot
+  brockley: "broccoli", // observed typo
 };
 
 function cleanPantry(rawTerms) {
-  // 1) normalize → 2) map synonyms → 3) keep whitelist → 4) fuzzy-correct to whitelist
   const out = new Set();
 
-  for (const t of uniqLower(rawTerms)) {
-    const mapped = MAP[t] || t;
+  for (const tRaw of uniqLower(rawTerms)) {
+    const t = MAP[tRaw] || tRaw;
 
     // exact whitelist hit
-    if (WHITELIST.includes(mapped)) { out.add(mapped); continue; }
+    if (WHITELIST.includes(t)) { out.add(t); continue; }
 
-    // fuzzy: nearest whitelist term (distance ≤ 2)
-    const nearest = nearestWhitelist(mapped);
-    if (nearest) out.add(nearest);
+    // STRICT fuzzy: only for length >=5 and edit distance <=1
+    if (t.length >= 5) {
+      const nearest = nearestWhitelistStrict(t);
+      if (nearest) { out.add(nearest); continue; }
+    }
+    // else drop it
   }
   return [...out];
 }
 
-function nearestWhitelist(term) {
-  let best = null, bestDist = 3; // max distance we accept
+function nearestWhitelistStrict(term) {
+  let best = null, bestDist = 2; // accept only <=1
   for (const w of WHITELIST) {
     const d = lev(term, w);
     if (d < bestDist) { bestDist = d; best = w; }
   }
-  return best; // may be null if all > 2
+  return bestDist <= 1 ? best : null;
 }
 
-// Tiny Levenshtein
+// Levenshtein
 function lev(a, b) {
   if (a === b) return 0;
   const al = a.length, bl = b.length;
@@ -147,9 +158,9 @@ function lev(a, b) {
     for (let j = 1; j <= bl; j++) {
       const cost = a[i - 1] === b[j - 1] ? 0 : 1;
       dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,     // deletion
-        dp[i][j - 1] + 1,     // insertion
-        dp[i - 1][j - 1] + cost // substitution
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost
       );
     }
   }
