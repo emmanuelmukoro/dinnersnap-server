@@ -1,113 +1,78 @@
-// api/analyze.js — Vercel serverless: Vision OCR → pantry → recipes (Spoonacular + LLM fallback)
+// /api/analyze.js — Vision + Spoonacular + LLM fallback, with tastier LLM prompt and debug logs
+export const config = {
+  runtime: "edge",
+};
 
-export default async function handler(req, res) {
-  try {
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "Use POST" });
+const SPOON_KEY = process.env.SPOON_KEY || "";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const GCV_KEY = process.env.GCV_KEY || "";
+
+// ===== Helpers =====
+const okJson = (data, status = 200) =>
+  new Response(JSON.stringify(data), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+
+const bad = (msg, status = 400) => okJson({ error: msg }, status);
+
+const uniqLower = (arr) => [...new Set(arr.map((s) => String(s).toLowerCase().trim()))];
+
+// strict Levenshtein (small & fast enough for our shortlist)
+function lev(a, b) {
+  if (a === b) return 0;
+  const m = a.length, n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = new Array(n + 1);
+  let cur = new Array(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    cur[0] = i;
+    const ca = a.charCodeAt(i - 1);
+    for (let j = 1; j <= n; j++) {
+      const cb = b.charCodeAt(j - 1);
+      const cost = ca === cb ? 0 : 1;
+      cur[j] = Math.min(
+        cur[j - 1] + 1,
+        prev[j] + 1,
+        prev[j - 1] + cost
+      );
     }
-
-    const { imageBase64, pantryOverride, prefs = {} } = req.body || {};
-
-    // Step 1: build pantry
-    let pantry = [];
-    if (Array.isArray(pantryOverride) && pantryOverride.length) {
-      pantry = cleanPantry(pantryOverride.map(String).map((s) => s.toLowerCase()));
-    } else if (imageBase64) {
-      const vision = await callVision(imageBase64);
-      pantry = cleanPantry(vision);
-    } else {
-      return res.status(400).json({ error: "imageBase64 required (or pantryOverride)" });
-    }
-
-    // Step 2: fetch recipes (Spoonacular, constrained to savory mains)
-    let recipes = [];
-    try {
-      recipes = await fetchSpoonacular(pantry, prefs);
-    } catch (e) {
-      console.error("Spoonacular error:", e);
-    }
-
-    // Step 3: LLM fallback to ensure we always return something savory
-    if (!recipes.length) {
-      try {
-        recipes = await llmFallback(pantry, prefs);
-      } catch (e) {
-        console.error("LLM fallback error:", e);
-      }
-    }
-
-    return res.status(200).json({ pantry, recipes });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "Server error" });
+    const t = prev; prev = cur; cur = t;
   }
+  return prev[n];
 }
 
-/* ---------------- Vision (OCR) ---------------- */
-
-async function callVision(imageBase64) {
-  if (!process.env.GCV_KEY) return [];
-  const url = `https://vision.googleapis.com/v1/images:annotate?key=${process.env.GCV_KEY}`;
-  const payload = {
-    requests: [
-      {
-        image: { content: imageBase64.split(",").pop() },
-        features: [
-          { type: "TEXT_DETECTION" },
-          { type: "LABEL_DETECTION", maxResults: 10 },
-          { type: "LOGO_DETECTION" },
-          { type: "OBJECT_LOCALIZATION" },
-        ],
-      },
-    ],
-  };
-  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-  const j = await r.json();
-  const r0 = j?.responses?.[0] || {};
-
-  // ---- OCR tokens (aggressive cleanup) ----
-  const ocrRaw = (r0.textAnnotations?.[0]?.description || "").toLowerCase();
+// ===== OCR -> tokens (more selective) =====
+function tokensFromVisionResponse(r) {
+  const ocrRaw = (r.textAnnotations?.[0]?.description || "").toLowerCase();
   const RAW_TOKENS = ocrRaw
     .split(/[^a-z]+/g)
     .map((t) => t.trim())
-    .filter((t) => t.length >= 4); // ignore tiny tokens
+    .filter((t) => t.length >= 4);
 
   const FOODISH_HINTS = new Set([
     "ingredients","organic","sauce","soup","canned","tin","dried","fresh","frozen",
     "beans","peas","lentils","broccoli","banana","tomato","onion","garlic","squash",
     "chickpea","chickpeas","feta","rice","pasta","oil","olive","seed","seeds","flour",
     "oats","milk","yogurt","cheese","lemon","pepper","spinach","mushroom","potato",
-    "coconut","cream","coconutcream","coconutmilk"
+    "coconut","cream","creamed","coconutcream"
   ]);
-  const ocrTokens = RAW_TOKENS.filter((t) => FOODISH_HINTS.has(t));
 
-  // ---- labels/logos/objects as words ----
-  const labels = (r0.labelAnnotations || []).map((x) => (x.description || "").toLowerCase());
-  const logos = (r0.logoAnnotations || []).map((x) => (x.description || "").toLowerCase());
-  const objects = (r0.localizedObjectAnnotations || []).map((x) => (x.name || "").toLowerCase());
-
-  // some basic object → ingredient mapping
-  const mappedObjects = objects.map((o) => (o.includes("banana") ? "banana" : o.includes("broccoli") ? "broccoli" : o));
-
-  // combine raw terms
-  const rawTerms = [...ocrTokens, ...labels, ...logos, ...mappedObjects];
-  return rawTerms;
+  return RAW_TOKENS.filter((t) => FOODISH_HINTS.has(t));
 }
 
-/* ---------------- Pantry cleaning ---------------- */
-
+// ===== Whitelist + synonyms + strict fuzzy =====
 const WHITELIST = [
   "banana","broccoli","chickpeas","tomatoes","onion","garlic","olive oil","pasta",
-  "courgette","feta","orzo","rice","egg","spring onion","lemon",
+  "courgette","feta","orzo","rice","egg","spring onion","lemon","coconut cream","coconut milk",
   "butternut squash","squash","carrot","pepper","bell pepper","spinach",
   "potato","mushroom","cheese","yogurt","milk",
-  "coconut milk","coconut cream",
-  // proteins
   "chicken","chicken breast","beef","pork","fish","salmon","tuna",
-  // tins & pulses
-  "beans","kidney beans","black beans","lentils",
-  // basics
-  "bread","tortilla","wrap","oats","flour","sugar","butter","salt","pepper"
+  "bread","tortilla","wrap","beans","kidney beans","black beans","lentils",
+  "cucumber","lettuce","cabbage","kale","avocado","apple","orange","pear",
+  "oats","flour","sugar","butter","salt","pepper"
 ];
 
 const MAP = {
@@ -122,34 +87,11 @@ const MAP = {
   onions: "onion",
   eggs: "egg",
   brockley: "broccoli",
-  "coconut creme": "coconut cream",
-  "coconut milk": "coconut milk",
+  "coconutcream": "coconut cream",
 };
 
-function uniqLower(arr) {
-  return Array.from(new Set(arr.map((x) => String(x || "").toLowerCase())));
-}
-
-function cleanPantry(rawTerms) {
-  const out = new Set();
-  for (const tRaw of uniqLower(rawTerms)) {
-    const t = MAP[tRaw] || tRaw;
-
-    // exact whitelist
-    if (WHITELIST.includes(t)) { out.add(t); continue; }
-
-    // strict fuzzy (len>=5 && distance<=1)
-    if (t.length >= 5) {
-      const nearest = nearestWhitelistStrict(t);
-      if (nearest) { out.add(nearest); continue; }
-    }
-    // else drop it
-  }
-  return [...out];
-}
-
 function nearestWhitelistStrict(term) {
-  let best = null, bestDist = 2;
+  let best = null, bestDist = 2; // allow distance ≤ 1 only
   for (const w of WHITELIST) {
     const d = lev(term, w);
     if (d < bestDist) { bestDist = d; best = w; }
@@ -157,118 +99,249 @@ function nearestWhitelistStrict(term) {
   return bestDist <= 1 ? best : null;
 }
 
-// Levenshtein
-function lev(a, b) {
-  const m = a.length, n = b.length;
-  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+function cleanPantry(rawTerms) {
+  const out = new Set();
+  for (const tRaw of uniqLower(rawTerms)) {
+    const t = MAP[tRaw] || tRaw;
+    if (WHITELIST.includes(t)) { out.add(t); continue; }
+    if (t.length >= 5) {
+      const n = nearestWhitelistStrict(t);
+      if (n) { out.add(n); continue; }
     }
+    // else drop
   }
-  return dp[m][n];
+  return [...out];
 }
 
-/* ---------------- Spoonacular (main courses only) ---------------- */
-
-async function fetchSpoonacular(pantry, prefs) {
-  if (!process.env.SPOON_KEY) return [];
-  const include = encodeURIComponent(pantry.join(","));
-  const params =
-    `includeIngredients=${include}` +
-    `&type=main%20course` +
-    `&ignorePantry=true` +
-    `&instructionsRequired=true` +
-    `&addRecipeInformation=true` +
-    `&maxReadyTime=${Math.max(10, Math.min(90, Number(prefs?.time || 30)))}` +
-    `&number=8&sort=min-missing-ingredients&sortDirection=asc`;
-  const url = `https://api.spoonacular.com/recipes/complexSearch?${params}&apiKey=${process.env.SPOON_KEY}`;
-
-  const r = await fetch(url);
-  const j = await r.json();
-  if (!j?.results) return [];
-
-  const BAD = /dessert|sweet|ice\s*cream|jam|smoothie|shake|cookie|brownie|cake|cupcake|pancake|muffin|fudge/i;
-
-  const items = j.results
-    .filter((x) => !BAD.test(x.title))
-    .map((x) => {
-      const used = (x.usedIngredients || []).map((i) => i.name?.toLowerCase?.() || "");
-      const missed = (x.missedIngredients || []).map((i) => i.name?.toLowerCase?.() || "");
-      const all = [...used, ...missed];
-      return {
-        id: `spn_${x.id}`,
-        title: x.title,
-        time: x.readyInMinutes ?? prefs?.time ?? 20,
-        cost: 2.5,
-        energy: "hob",
-        ingredients: all.map((n) => ({ name: n, have: pantry.includes(n) })),
-        steps: [],
-        badges: ["spoonacular"],
-      };
-    });
-
-  return items;
+// ===== Vision =====
+async function callVision(imageBase64) {
+  // imageBase64 is a full data URL when it reaches here (`data:image/jpeg;base64,...`)
+  const url = `https://vision.googleapis.com/v1/images:annotate?key=${GCV_KEY}`;
+  const body = {
+    requests: [{
+      image: { content: imageBase64.split(",")[1] || "" },
+      features: [
+        { type: "TEXT_DETECTION" },
+        { type: "LABEL_DETECTION", maxResults: 50 },
+        { type: "OBJECT_LOCALIZATION" }
+      ]
+    }]
+  };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Vision ${res.status}`);
+  const data = await res.json();
+  return data.responses?.[0] || {};
 }
 
-/* ---------------- LLM fallback (savory only) ---------------- */
+function tokensFromLabels(r) {
+  const labels = r.labelAnnotations || [];
+  return labels
+    .filter(l => (l.description || "").length >= 3 && (l.score || 0) >= 0.6)
+    .map(l => l.description.toLowerCase());
+}
 
-async function llmFallback(pantry, prefs) {
-  if (!process.env.OPENAI_API_KEY) return [];
-  const system = `You are a recipe generator. Output ONLY JSON.
-Rules:
-- Create 1–3 quick, savory DINNER recipes (not dessert, not smoothie, not jam, not ice cream).
-- Use the given pantry as primary ingredients.
-- Ready in <= ${prefs?.time || 25} minutes.
-- Prefer single-pan methods (hob) when possible.
-- JSON shape:
-{"recipes":[{"id":"llm_1","title":"...","time":15,"cost":2.2,"energy":"hob",
-"ingredients":[{"name":"...","have":true}],"steps":[{"id":"s1","text":"..."}],"badges":["fallback"]}]}
+function tokensFromObjects(r) {
+  const objs = r.localizedObjectAnnotations || [];
+  return objs
+    .filter(o => (o.name || "").length >= 3 && (o.score || 0) >= 0.6)
+    .map(o => o.name.toLowerCase());
+}
+
+// ===== Spoonacular =====
+async function spoonacularByIngredients(pantry, prefs) {
+  if (!SPOON_KEY) return [];
+
+  // prefer savory; avoid dessert keywords
+  const exclude = ["dessert","ice cream","cupcake","cookie","brownie","cake","sweet","pudding"];
+  const base = `https://api.spoonacular.com/recipes/complexSearch`;
+  const params = new URLSearchParams({
+    apiKey: SPOON_KEY,
+    includeIngredients: pantry.join(","),
+    number: "6",
+    sort: "max-used-ingredients",
+    addRecipeInformation: "true",
+    instructionsRequired: "true",
+    fillIngredients: "true",
+    ranking: "2", // balance popularity vs. used-ingredients
+  });
+
+  if (prefs?.time) params.set("maxReadyTime", String(prefs.time));
+  if (prefs?.diet && prefs.diet !== "none") params.set("diet", prefs.diet);
+  // filter out desserts by type & exclude terms
+  params.set("type", "main course");
+
+  const url = `${base}?${params.toString()}`;
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const data = await res.json();
+  const results = Array.isArray(data?.results) ? data.results : [];
+
+  const filtered = results.filter(r => {
+    const title = (r.title || "").toLowerCase();
+    return !exclude.some(k => title.includes(k));
+  });
+
+  // map into your app shape
+  return filtered.map((r, idx) => ({
+    id: r.id ?? `spoon-${idx}`,
+    title: r.title,
+    time: r.readyInMinutes ?? 20,
+    cost: 2.5,                 // we don’t get cost reliably here
+    energy: "hob",
+    score: r.healthScore ? Math.round((r.healthScore/100)*100)/100 : undefined,
+    badges: [],
+    ingredients: (r.extendedIngredients || []).map(ing => ({
+      name: (ing.name || "").toLowerCase(),
+      have: pantry.includes((ing.name || "").toLowerCase())
+    })),
+    steps: Array.isArray(r.analyzedInstructions?.[0]?.steps)
+      ? r.analyzedInstructions[0].steps.map(s => ({
+          id: s.number,
+          text: s.step
+        }))
+      : [],
+  }));
+}
+
+// ===== LLM fallback (tastier, savory, with seasonings) =====
+async function llmComposeRecipe(pantry, prefs) {
+  if (!OPENAI_API_KEY) return null;
+
+  const savoryBias = `
+You are writing a QUICK, SAVORY, TASTY dinner recipe using the pantry items.
+Do NOT suggest desserts unless the pantry is obviously dessert-only.
+Assume the user has basic pantry staples and seasonings:
+salt, black pepper, oil, butter, soy sauce, vinegar/lemon, garlic, onion, ginger,
+paprika, cumin, coriander, chilli flakes, curry powder, oregano, thyme, rosemary,
+all-purpose seasoning, and simple fresh herbs if helpful (e.g. chives, parsley).
+If the dish would be plain, actively include appropriate seasonings from that list.
+Prefer a single-pan or single-pot approach when possible.
+If there is coconut cream/milk + legumes (e.g., chickpeas), build a proper curry base
+(garlic/onion/ginger + spices + simmer) so it tastes great.
+Always target ≤ ${prefs?.time ?? 25} minutes unless impossible.
 `;
 
-  const user = JSON.stringify({ pantry, prefs });
+  const user = `
+PANTRY: ${JSON.stringify(pantry)}
+DIET: ${prefs?.diet ?? "none"} • SERVINGS: ${prefs?.servings ?? 2} • ENERGY: ${prefs?.energyMode ?? "hob"}
+RETURN JSON with:
+{
+  "id": "llm-1",
+  "title": "Name",
+  "time": number,
+  "cost": 2.5,
+  "energy": "hob" | "oven" | "airfryer" | "microwave",
+  "ingredients": [{"name": "string", "have": true|false}, ...],
+  "steps": [{"id": 1, "text": "short action"}, ...],
+  "badges": ["15-min","one-pan", ...]
+}
+- Use pantry items as "have": true. Add reasonable extras (spices, aromatics) as "have": false.
+- Keep steps compact (<= 8), but include the seasoning/flavour steps so it’s NOT bland.
+`;
 
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+  const body = {
+    model: "gpt-4o-mini",
+    temperature: 0.6,
+    messages: [
+      { role: "system", content: savoryBias.trim() },
+      { role: "user", content: user.trim() }
+    ],
+    response_format: { type: "json_object" }
+  };
+
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+      "content-type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
     },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      temperature: 0.3,
-    }),
+    body: JSON.stringify(body),
   });
-  const j = await r.json();
-  const text = j?.choices?.[0]?.message?.content || "{}";
 
-  let parsed = {};
-  try { parsed = JSON.parse(text); } catch {}
-  const list = Array.isArray(parsed?.recipes) ? parsed.recipes : [];
+  if (!res.ok) return null;
+  const data = await res.json();
+  let txt = data?.choices?.[0]?.message?.content || "{}";
+  try {
+    const r = JSON.parse(txt);
+    // normalize minimal fields for the app
+    r.id = r.id || "llm-1";
+    r.energy = r.energy || "hob";
+    if (!Array.isArray(r.ingredients)) r.ingredients = [];
+    if (!Array.isArray(r.steps)) r.steps = [];
+    return r;
+  } catch {
+    return null;
+  }
+}
 
-  // Minimal normalization
-  return list.map((x, idx) => ({
-    id: x.id || `llm_${idx + 1}`,
-    title: x.title || "Quick dinner",
-    time: Number(x.time || prefs?.time || 20),
-    cost: Number(x.cost || 2.0),
-    energy: x.energy || "hob",
-    ingredients: Array.isArray(x.ingredients)
-      ? x.ingredients.map((i) => ({
-          name: (i.name || "").toLowerCase(),
-          have: Boolean(i.have),
-        }))
-      : pantry.map((n) => ({ name: n, have: true })),
-    steps: Array.isArray(x.steps)
-      ? x.steps.map((s, i) => ({ id: s.id || `s${i + 1}`, text: s.text || "" }))
-      : [{ id: "s1", text: "Cook everything." }],
-    badges: Array.isArray(x.badges) ? x.badges : ["fallback"],
-  }));
+// ===== Main handler =====
+export default async function handler(req) {
+  if (req.method !== "POST") return bad("POST only", 405);
+
+  let body = {};
+  try { body = await req.json(); } catch {}
+  const { imageBase64, pantryOverride, prefs, debug } = body || {};
+
+  if (!imageBase64 && !pantryOverride) {
+    return bad("imageBase64 required (or pantryOverride)");
+  }
+
+  const debugInfo = {
+    source: imageBase64 ? "vision" : "pantryOverride",
+    pantryFrom: [],
+    cleanedPantry: [],
+    spoonacularCount: 0,
+    usedLLM: false
+  };
+
+  // ---- Build pantry terms ----
+  let pantryTerms = [];
+  if (imageBase64) {
+    const r = await callVision(imageBase64);
+    const tOcr = tokensFromVisionResponse(r);
+    const tLbl = tokensFromLabels(r);
+    const tObj = tokensFromObjects(r);
+    debugInfo.pantryFrom = { ocr: tOcr, labels: tLbl, objects: tObj };
+    pantryTerms = cleanPantry([...tOcr, ...tLbl, ...tObj]);
+  } else {
+    pantryTerms = cleanPantry(
+      Array.isArray(pantryOverride)
+        ? pantryOverride.map(x => (typeof x === "string" ? x : x?.name || ""))
+        : []
+    );
+  }
+
+  // Ensure we include directly typed “good” items if simple mistakes occur
+  // (e.g., "chickpeas", "coconut cream", "banana", "pasta")
+  debugInfo.cleanedPantry = pantryTerms;
+
+  // ---- 1) Try Spoonacular
+  let recipes = [];
+  try {
+    recipes = await spoonacularByIngredients(pantryTerms, prefs);
+  } catch (e) {
+    console.log("Spoonacular error", e?.message || e);
+  }
+  debugInfo.spoonacularCount = recipes.length;
+
+  // ---- 2) LLM fallback if nothing decent
+  if (!recipes.length) {
+    const llm = await llmComposeRecipe(pantryTerms, prefs);
+    if (llm) {
+      debugInfo.usedLLM = true;
+      recipes = [llm];
+    }
+  }
+
+  console.log("analyze debug:", debugInfo);
+
+  return okJson({
+    pantry: pantryTerms,
+    recipes,
+    debug: debug ? debugInfo : undefined
+  });
 }
