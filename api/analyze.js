@@ -1,27 +1,36 @@
 // api/analyze.js
-// Dinnersnap hybrid: Google Vision -> cleaned pantry -> Spoonacular (strict) -> LLM fallback (tasty + seasoned)
-
-export const config = { runtime: "edge" }; // Vercel Edge
+// Vision -> cleaned pantry -> Spoonacular (main-course only, no drinks/desserts) -> LLM fallback (savory + seasoned)
+export const config = { runtime: "edge" };
 
 const GCV_KEY = process.env.GCV_KEY;
 const SPOON_KEY = process.env.SPOON_KEY || process.env.SPOONACULAR_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// ---------- utilities ----------
 const json = (status, obj) =>
   new Response(JSON.stringify(obj), {
     status,
     headers: { "content-type": "application/json" },
   });
 
+// --- classifiers / helpers ---
 const DESSERT_WORDS = new Set([
-  "dessert","pudding","ice cream","smoothie","shake","cookie","brownie",
-  "cupcake","cake","muffin","pancake","waffle","jam","jelly","compote",
-  "truffle","fudge","sorbet","parfait","custard","tart","shortbread",
+  "dessert","pudding","ice cream","smoothie","shake","cookie","brownie","cupcake",
+  "cake","muffin","pancake","waffle","jam","jelly","compote","truffle","fudge",
+  "sorbet","parfait","custard","tart","shortbread","licorice","cobbler"
+]);
+
+const DRINK_WORDS = new Set([
+  "drink","cocktail","beverage","mocktail","soda","punch","spritzer","cobbler","toddy"
+]);
+
+const ALCOHOL_WORDS = new Set([
+  "brandy","rum","vodka","gin","whisky","whiskey","bourbon","tequila","wine","liqueur","amaretto","cognac","port","sherry"
 ]);
 
 const MEAT_WORDS = new Set(["chicken","beef","pork","lamb","bacon","ham","turkey","shrimp","prawn","salmon","tuna","fish"]);
 const PASTA_WORDS = new Set(["pasta","spaghetti","macaroni","penne","farfalle","orzo","fusilli","linguine","tagliatelle"]);
+
+const GENERIC_WORDS = new Set(["pasta","rice","bread","flour","sugar","oil","salt","pepper"]);
 
 function titleHasAny(title, set) {
   const t = title.toLowerCase();
@@ -29,64 +38,64 @@ function titleHasAny(title, set) {
   return false;
 }
 
-// ---------- OCR + cleanup ----------
+function hasSpecificPantryWordInTitleOrIngredients(item, pantrySpecific) {
+  const t = (item.title || "").toLowerCase();
+  const ings = (item.extendedIngredients || []).map(i => String(i.name || "").toLowerCase());
+  return pantrySpecific.some(p => t.includes(p) || ings.some(n => n.includes(p)));
+}
+
+// ---------- Vision ----------
 async function callVision(imageBase64) {
   const body = {
-    requests: [
-      {
-        image: { content: imageBase64.replace(/^data:image\/\w+;base64,/, "") },
-        features: [
-          { type: "TEXT_DETECTION", maxResults: 1 },
-          { type: "LABEL_DETECTION", maxResults: 10 },
-          { type: "OBJECT_LOCALIZATION", maxResults: 10 },
-        ],
-      },
-    ],
+    requests: [{
+      image: { content: imageBase64.replace(/^data:image\/\w+;base64,/, "") },
+      features: [
+        { type: "TEXT_DETECTION", maxResults: 1 },
+        { type: "LABEL_DETECTION", maxResults: 10 },
+        { type: "OBJECT_LOCALIZATION", maxResults: 10 },
+      ],
+    }],
   };
 
   const r = await fetch(
     `https://vision.googleapis.com/v1/images:annotate?key=${GCV_KEY}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    }
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
   );
   const j = await r.json();
   const res = j?.responses?.[0] || {};
 
-  // --- NEW: aggressive OCR token clean-up (keeps "foodish" hints only) ---
+  // OCR tokens -> keep foodish tokens only (less background noise)
   const ocrRaw = (res.textAnnotations?.[0]?.description || "").toLowerCase();
   const RAW_TOKENS = ocrRaw
     .split(/[^a-z]+/g)
-    .map((t) => t.trim())
-    .filter((t) => t.length >= 4);
+    .map(t => t.trim())
+    .filter(t => t.length >= 4);
 
   const FOODISH_HINTS = new Set([
     "ingredients","organic","sauce","soup","canned","tin","dried","fresh","frozen",
     "beans","peas","lentils","broccoli","banana","tomato","onion","garlic","squash",
     "chickpea","chickpeas","feta","rice","pasta","oil","olive","seed","seeds","flour",
     "oats","milk","yogurt","cheese","lemon","pepper","spinach","mushroom","potato",
+    "avocado","orange","coconut","cream","spaghetti"
   ]);
+  const ocrTokens = RAW_TOKENS.filter(t => FOODISH_HINTS.has(t));
 
-  const ocrTokens = RAW_TOKENS.filter((t) => FOODISH_HINTS.has(t));
-
-  const labels = (res.labelAnnotations || []).map((x) => x.description?.toLowerCase()).filter(Boolean);
-  const objects = (res.localizedObjectAnnotations || []).map((x) => x.name?.toLowerCase()).filter(Boolean);
+  const labels  = (res.labelAnnotations || []).map(x => x.description?.toLowerCase()).filter(Boolean);
+  const objects = (res.localizedObjectAnnotations || []).map(x => x.name?.toLowerCase()).filter(Boolean);
 
   return { ocrTokens, labels, objects };
 }
 
-// whitelist + strict fuzzy
+// ---------- pantry cleanup ----------
 const WHITELIST = [
-  "banana","broccoli","chickpeas","tomatoes","onion","garlic","olive oil","pasta",
-  "courgette","feta","orzo","rice","egg","spring onion","lemon",
+  "banana","broccoli","chickpeas","tomatoes","onion","garlic","olive oil","pasta","spaghetti",
+  "courgette","feta","orzo","rice","egg","spring onion","lemon","orange","avocado",
   "butternut squash","squash","carrot","pepper","bell pepper","spinach",
-  "potato","mushroom","cheese","yogurt","milk",
+  "potato","mushroom","cheese","yogurt","milk","coconut cream",
   "chicken","chicken breast","beef","pork","fish","salmon","tuna",
   "bread","tortilla","wrap","beans","kidney beans","black beans","lentils",
   "cucumber","lettuce","cabbage","kale","avocado","apple","orange","pear",
-  "oats","flour","sugar","butter","salt","pepper", "coconut cream"
+  "oats","flour","sugar","butter","salt","pepper"
 ];
 
 const MAP = {
@@ -100,25 +109,17 @@ const MAP = {
   tomato: "tomatoes",
   onions: "onion",
   eggs: "egg",
-  brockley: "broccoli", // common misspelling you saw
+  brockley: "broccoli", // typo
 };
 
-function uniqLower(a) {
-  const s = new Set();
-  for (const x of a) s.add(String(x).toLowerCase());
-  return [...s];
-}
+function uniqLower(a) { const s = new Set(); for (const x of a) s.add(String(x).toLowerCase()); return [...s]; }
 function lev(a, b) {
   const m = [];
   for (let i = 0; i <= b.length; i++) m[i] = [i];
   for (let j = 0; j <= a.length; j++) m[0][j] = j;
   for (let i = 1; i <= b.length; i++) {
     for (let j = 1; j <= a.length; j++) {
-      m[i][j] = Math.min(
-        m[i - 1][j] + 1,
-        m[i][j - 1] + 1,
-        m[i - 1][j - 1] + (b.charAt(i - 1) === a.charAt(j - 1) ? 0 : 1)
-      );
+      m[i][j] = Math.min(m[i-1][j] + 1, m[i][j-1] + 1, m[i-1][j-1] + (b.charAt(i-1) === a.charAt(j-1) ? 0 : 1));
     }
   }
   return m[b.length][a.length];
@@ -144,58 +145,79 @@ function cleanPantry(rawTerms) {
   return [...out];
 }
 
-// ---------- Spoonacular (strict) ----------
+// ---------- Spoonacular (strict dinner-mode) ----------
 async function spoonacularRecipes(pantry, prefs) {
   if (!SPOON_KEY) return { results: [], debug: { note: "no SPOON_KEY" } };
 
-  // Basic diet inference: if no meat words, prefer vegetarian results.
-  const hasMeatInPantry = pantry.some((p) => MEAT_WORDS.has(p));
+  const hasMeat = pantry.some(p => MEAT_WORDS.has(p));
   const include = pantry.join(",");
+
   const url = new URL("https://api.spoonacular.com/recipes/complexSearch");
   url.searchParams.set("apiKey", SPOON_KEY);
   url.searchParams.set("includeIngredients", include);
   url.searchParams.set("instructionsRequired", "true");
   url.searchParams.set("addRecipeInformation", "true");
   url.searchParams.set("sort", "max-used-ingredients");
-  url.searchParams.set("number", "12");
+  url.searchParams.set("number", "18");
   url.searchParams.set("ignorePantry", "true");
-  if (!hasMeatInPantry) url.searchParams.set("diet", "vegetarian");
+  url.searchParams.set("type", "main course");              // <- dinner-ish only
+  url.searchParams.set("excludeIngredients",               // <- block alcohol
+    Array.from(ALCOHOL_WORDS).join(",")
+  );
+  const timeCap = Math.max(10, (prefs?.time ?? 25) + 10);
+  url.searchParams.set("maxReadyTime", String(timeCap));
+  if (!hasMeat) url.searchParams.set("diet", "vegetarian");
 
   const r = await fetch(url.toString());
   const j = await r.json();
-
   const raw = Array.isArray(j?.results) ? j.results : [];
 
-  // Filter out dessert-ish and require real overlap.
-  const filtered = raw.filter((it) => {
+  // pantry specific (non-generic) list for extra relevance check
+  const pantrySpecific = pantry.filter(p => !GENERIC_WORDS.has(p));
+
+  const filtered = raw.filter(it => {
     const title = it.title || "";
-    if (titleHasAny(title, DESSERT_WORDS)) return false;
+    const lowerTitle = title.toLowerCase();
+    const dishTypes = (it.dishTypes || []).map(d => String(d).toLowerCase());
 
-    const usedCount = it.usedIngredientCount ?? 0;
-    const missedCount = it.missedIngredientCount ?? 0;
-    const overlapOK = usedCount >= 2 || usedCount >= Math.min(2, pantry.length); // need some overlap
+    // hard rejects
+    if (titleHasAny(lowerTitle, DESSERT_WORDS)) return false;
+    if (titleHasAny(lowerTitle, DRINK_WORDS)) return false;
+    if (titleHasAny(lowerTitle, ALCOHOL_WORDS)) return false;
+    if (dishTypes.some(d => ["drink","beverage","cocktail","dessert"].includes(d))) return false;
 
-    // Don't suggest shrimp/salmon/etc. unless pantry has fish
-    if (titleHasAny(title, new Set(["shrimp","prawn","salmon","tuna","anchovy","sardine"])) &&
-        !pantry.some((p) => ["shrimp","prawn","salmon","tuna","fish"].includes(p))) {
+    // overlap / time
+    const used   = it.usedIngredientCount ?? 0;
+    const missed = it.missedIngredientCount ?? 0;
+    const time   = it.readyInMinutes ?? 999;
+    if (used < 2) return false;                 // require real overlap
+    if (time > timeCap) return false;
+
+    // require at least one specific pantry token to appear (title or ingredients)
+    if (pantrySpecific.length > 0 && !hasSpecificPantryWordInTitleOrIngredients(it, pantrySpecific)) {
       return false;
     }
 
-    // Avoid “mac and cheese” if we only know generic pasta and no cheese/milk
-    if (title.toLowerCase().includes("macaroni and cheese")) {
-      const hasDairy = pantry.some((p) => ["cheese","milk","cream"].includes(p));
+    // avoid mac&cheese if no dairy in pantry
+    if (lowerTitle.includes("macaroni and cheese")) {
+      const hasDairy = pantry.some(p => ["cheese","milk","cream"].includes(p));
       if (!hasDairy) return false;
     }
 
-    return overlapOK && missedCount <= 6; // keep realistic
+    // avoid seafood if pantry has no fish
+    if ((/shrimp|prawn|salmon|tuna|anchovy|sardine/).test(lowerTitle) &&
+        !pantry.some(p => ["shrimp","prawn","salmon","tuna","fish"].includes(p))) {
+      return false;
+    }
+
+    return true;
   });
 
-  // Attach a light score for client sorting if you want
   const scored = filtered.map((it) => {
-    const used = it.usedIngredientCount ?? 0;
+    const used   = it.usedIngredientCount ?? 0;
     const missed = it.missedIngredientCount ?? 0;
-    const time = it.readyInMinutes ?? 30;
-    const score = 0.7 * (used / (used + missed + 1)) + 0.3 * (1 - Math.min(time, 60) / 60);
+    const time   = it.readyInMinutes ?? 30;
+    const score  = 0.7 * (used / (used + missed + 1)) + 0.3 * (1 - Math.min(time, 60) / 60);
     return {
       id: String(it.id),
       title: it.title,
@@ -215,56 +237,43 @@ async function spoonacularRecipes(pantry, prefs) {
     };
   });
 
-  return { results: scored, debug: { spoonacularRawCount: raw.length, kept: scored.length } };
+  // if spoonacular still returns oddballs, leave to caller to decide LLM
+  return { results: scored, debug: { rawCount: raw.length, kept: scored.length, timeCap } };
 }
 
-// ---------- LLM fallback ----------
+// ---------- LLM fallback (savory + seasoned) ----------
 async function llmRecipe(pantry, prefs) {
   if (!OPENAI_API_KEY) return null;
 
-  const system = `You are “DinnerSnap”—a practical 20-minute home-cook assistant.
-Write a **savory** recipe (NOT dessert) that uses the user's pantry as the core.
-If you need flavour, YOU MAY add common cupboard seasonings even if not listed: 
-salt, pepper, garlic, onion, chilli, smoked paprika, cumin, curry powder, dried herbs (oregano/basil/thyme), soy sauce, stock cube, lemon/lime.
-Prefer a sensible dinner (stir-fry, curry, pasta, soup, traybake) over sweets.
-Keep it simple, 5–8 steps, one pan if you can.`;
+  const system = `You are “DinnerSnap”—a practical 20-minute dinner helper.
+Create a **savory main** (NOT a dessert or drink) using the pantry as the core.
+Season boldly with common cupboard items if needed (salt, pepper, garlic, onion, chilli, smoked paprika, cumin, curry powder,
+dried herbs, stock cube, soy sauce, lemon). Keep it simple, 5–8 steps, minimal pans.`;
 
-  const user = {
-    pantry,
-    prefs,
-    request: "Give me one recipe under 20–25 minutes.",
-  };
+  const user = `Pantry: ${pantry.join(", ")}
+Diet: ${prefs?.diet ?? "none"}
+Energy: ${prefs?.energyMode ?? "hob"}
+Budget: ~£${prefs?.budget ?? 3}/serv
+Time: ≤${prefs?.time ?? 25} min
+
+Return JSON with keys: title, time, cost, energy, ingredients[{name,have}], steps[{id,text}], badges[].`;
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
+    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
     body: JSON.stringify({
       model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: system },
-        {
-          role: "user",
-          content:
-            `Pantry: ${pantry.join(", ")}\nDiet: ${prefs?.diet ?? "none"}\n` +
-            `Energy: ${prefs?.energyMode ?? "hob"}\nBudget: ~£${prefs?.budget ?? 3}/serv\nTime: ≤${prefs?.time ?? 25} min\n\n` +
-            `Return JSON with keys: title, time, cost, energy, ingredients[{name,have}], steps[{id,text}], badges[].`,
-        },
-      ],
       temperature: 0.4,
+      messages: [{ role: "system", content: system }, { role: "user", content: user }],
     }),
   });
   const j = await r.json();
-
   const txt = j?.choices?.[0]?.message?.content || "";
-  // extremely lenient JSON capture
   const m = txt.match(/\{[\s\S]*\}$/);
   if (!m) return null;
+
   try {
     const parsed = JSON.parse(m[0]);
-    // ensure id/shape
     parsed.id = parsed.id || `llm-${Date.now()}`;
     parsed.energy = parsed.energy || "hob";
     parsed.cost = parsed.cost ?? 2.0;
@@ -278,9 +287,7 @@ Keep it simple, 5–8 steps, one pan if you can.`;
       text: s.text || String(s),
     }));
     return parsed;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 // ---------- handler ----------
@@ -288,56 +295,49 @@ export default async function handler(req) {
   if (req.method !== "POST") return json(405, { error: "POST only" });
 
   let body;
-  try {
-    body = await req.json();
-  } catch {
-    return json(400, { error: "invalid JSON body" });
-  }
+  try { body = await req.json(); } catch { return json(400, { error: "invalid JSON body" }); }
 
   const { imageBase64, pantryOverride, prefs = {} } = body || {};
   let pantry = [];
   let source = "";
 
   if (Array.isArray(pantryOverride) && pantryOverride.length) {
-    // caller sends final list directly (from “Find recipes”)
     pantry = cleanPantry(pantryOverride);
     source = "pantryOverride";
   } else if (imageBase64) {
     const res = await callVision(imageBase64);
-    const fromVision = [
-      ...(res.ocrTokens || []),
-      ...(res.labels || []),
-      ...(res.objects || []),
-    ];
+    const fromVision = [...(res.ocrTokens||[]), ...(res.labels||[]), ...(res.objects||[])];
     pantry = cleanPantry(fromVision);
     source = "vision";
   } else {
     return json(400, { error: "imageBase64 required (or pantryOverride)" });
   }
 
-  // Prefer Spoonacular, but **only keep dinner-ish, overlapping matches**.
+  // SPOONACULAR (strict)
   const sp = await spoonacularRecipes(pantry, prefs);
   let recipes = sp.results || [];
 
-  // If Spoonacular is empty OR clearly unhelpful (e.g. only 1 match and it’s weird), use LLM.
-  const spoonacularAcceptable = recipes.length >= 2 || (recipes.length >= 1 && recipes[0].score >= 0.35);
+  // Decide if Spoonacular is acceptable; otherwise prefer LLM
+  const topLooksBad =
+    recipes.length === 0 ||
+    titleHasAny((recipes[0]?.title || "").toLowerCase(), DESSERT_WORDS) ||
+    titleHasAny((recipes[0]?.title || "").toLowerCase(), DRINK_WORDS) ||
+    titleHasAny((recipes[0]?.title || "").toLowerCase(), ALCOHOL_WORDS) ||
+    (recipes[0]?.time ?? 999) > Math.max(10, (prefs?.time ?? 25) + 10);
+
   let usedLLM = false;
-  if (!spoonacularAcceptable) {
+  if (topLooksBad) {
     const r = await llmRecipe(pantry, prefs);
-    if (r) {
-      recipes = [r];
-      usedLLM = true;
-    }
+    if (r) { recipes = [r]; usedLLM = true; }
   }
 
-  // If still nothing, we’ll send pantry only (client can pop a message)
   const debug = {
     source,
-    pantryFrom: source === "vision" ? undefined : [],
     cleanedPantry: pantry,
-    spoonacularCount: sp.results?.length ?? 0,
+    spoonacularKept: sp.debug?.kept ?? 0,
+    spoonacularRaw: sp.debug?.rawCount ?? 0,
+    timeCap: sp.debug?.timeCap,
     usedLLM,
-    extra: sp.debug,
   };
 
   return json(200, { pantry, recipes, debug });
