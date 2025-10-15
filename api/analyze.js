@@ -3,11 +3,10 @@
 
 // --- TOP OF api/analyze.js ---
 export const config = {
-  runtime: 'nodejs20.x',   // <- force Node runtime
+  runtime: 'nodejs',
   maxDuration: 25,
   memory: 1024,
 };
-
 
 const GCV_KEY = process.env.GCV_KEY;
 const SPOON_KEY = process.env.SPOON_KEY || process.env.SPOONACULAR_KEY;
