@@ -1,5 +1,9 @@
 {
   "functions": {
-    "api/*.js": { "runtime": "nodejs20.x" }
+    "api/**/*.js": {
+      "runtime": "nodejs20.x",
+      "maxDuration": 25,
+      "memory": 1024
+    }
   }
 }
