@@ -1,22 +1,43 @@
 // api/analyze.js
-// Vision → cleaned pantry → Spoonacular (main course only) → LLM fallback → Emergency local recipe
+// Vision → cleaned pantry → Spoonacular (dinner-only, filtered) → LLM fallback (seasoned) → Emergency local
 
-// --- TOP OF api/analyze.js ---
+// --- Vercel runtime config ---
 export const config = {
-  runtime: 'nodejs',
+  runtime: "nodejs",   // IMPORTANT: nodejs (not edge)
   maxDuration: 25,
   memory: 1024,
+  regions: ["lhr1"],   // London (optional; you can remove if you prefer auto)
 };
 
+// --- Env keys ---
 const GCV_KEY = process.env.GCV_KEY;
 const SPOON_KEY = process.env.SPOON_KEY || process.env.SPOONACULAR_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
+// --- Small helpers ---
 const json = (status, obj) =>
   new Response(JSON.stringify(obj), {
     status,
     headers: { "content-type": "application/json" },
   });
+
+// Abort/timeout helpers
+function withTimeout(promiseFn, ms, label = "timeout") {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  return Promise.race([
+    promiseFn(ctrl.signal),
+    new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms + 5)),
+  ]).finally(() => clearTimeout(t));
+}
+
+async function tfetch(url, opts = {}, ms = 3000, label = `fetch timeout ${ms}ms`) {
+  return withTimeout(
+    (signal) => fetch(url, { ...opts, signal }),
+    ms,
+    label
+  );
+}
 
 // ---------- classifiers ----------
 const DESSERT_WORDS = new Set([
@@ -41,7 +62,7 @@ function hasSpecificTermInTitleOrIngredients(item, specificTerms) {
   return specificTerms.some(p => t.includes(p) || ings.some(n => n.includes(p)));
 }
 
-// ---------- Vision ----------
+// ---------- Vision (with OCR/labels/objects and time cap) ----------
 async function callVision(imageBase64) {
   const body = {
     requests: [{
@@ -54,23 +75,34 @@ async function callVision(imageBase64) {
     }],
   };
 
-  const r = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${GCV_KEY}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const r = await tfetch(
+    `https://vision.googleapis.com/v1/images:annotate?key=${GCV_KEY}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    3500,
+    "vision timeout"
+  );
   const j = await r.json();
   const res = j?.responses?.[0] || {};
 
-  // OCR → only foody tokens
+  // OCR tokens (aggressive cleanup)
   const ocrRaw = (res.textAnnotations?.[0]?.description || "").toLowerCase();
-  const RAW_TOKENS = ocrRaw.split(/[^a-z]+/g).map(t => t.trim()).filter(t => t.length >= 4);
+  const RAW_TOKENS = ocrRaw
+    .split(/[^a-z]+/g)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 4); // ignore tiny tokens like "uk", "so"
+
   const FOODISH_HINTS = new Set([
     "ingredients","organic","sauce","soup","canned","tin","dried","fresh","frozen",
     "beans","peas","lentils","broccoli","banana","tomato","onion","garlic","squash",
     "chickpea","chickpeas","feta","rice","pasta","spaghetti","oats","milk","yogurt","cheese",
     "lemon","orange","pepper","spinach","mushroom","potato","avocado","coconut","cream"
   ]);
+
+  // keep token if it looks food-ish
   const ocrTokens = RAW_TOKENS.filter(t => FOODISH_HINTS.has(t));
 
   const labels  = (res.labelAnnotations || []).map(x => x.description?.toLowerCase()).filter(Boolean);
@@ -82,9 +114,9 @@ async function callVision(imageBase64) {
 // ---------- pantry cleanup ----------
 const WHITELIST = [
   "banana","broccoli","chickpeas","tomatoes","onion","garlic","olive oil","pasta","spaghetti",
-  "courgette","feta","orzo","rice","egg","spring onion","lemon","orange","avocado",
+  "courgette","feta","orzo","rice","egg","spring onion","lemon","orange","avocado","coconut cream",
   "butternut squash","squash","carrot","pepper","bell pepper","spinach",
-  "potato","mushroom","cheese","yogurt","milk","coconut cream",
+  "potato","mushroom","cheese","yogurt","milk",
   "chicken","chicken breast","beef","pork","fish","salmon","tuna",
   "bread","tortilla","wrap","beans","kidney beans","black beans","lentils",
   "cucumber","lettuce","cabbage","kale","apple","pear","oats","flour","sugar","butter","salt","pepper"
@@ -100,7 +132,7 @@ const MAP = {
   tomato: "tomatoes",
   onions: "onion",
   eggs: "egg",
-  brockley: "broccoli",
+  brockley: "broccoli", // your observed typo
 };
 function uniqLower(a){const s=new Set();for(const x of a)s.add(String(x).toLowerCase());return [...s];}
 function lev(a,b){const m=[];for(let i=0;i<=b.length;i++)m[i]=[i];for(let j=0;j<=a.length;j++)m[0][j]=j;for(let i=1;i<=b.length;i++){for(let j=1;j<=a.length;j++){m[i][j]=Math.min(m[i-1][j]+1,m[i][j-1]+1,m[i-1][j-1]+(b.charAt(i-1)===a.charAt(j-1)?0:1));}}return m[b.length][a.length];}
@@ -118,7 +150,7 @@ function cleanPantry(rawTerms){
   return [...out];
 }
 
-// ---------- Spoonacular (strict dinner-mode) ----------
+// ---------- Spoonacular (dinner-mode, 2.5s cap, filter nonsense) ----------
 async function spoonacularRecipes(pantry, prefs){
   if(!SPOON_KEY) return { results: [], extra:{ note:"no SPOON_KEY" } };
 
@@ -139,16 +171,21 @@ async function spoonacularRecipes(pantry, prefs){
   url.searchParams.set("maxReadyTime", String(timeCap));
   if(!hasMeat) url.searchParams.set("diet", "vegetarian");
 
-  const r = await fetch(url.toString());
-  const j = await r.json();
+  let j = {};
+  try {
+    const r = await tfetch(url.toString(), {}, 2500, "spoonacular timeout"); // 2.5s cap
+    j = await r.json();
+  } catch(e) {
+    return { results: [], extra: { error: String(e?.message||e) } };
+  }
 
   const raw = Array.isArray(j?.results) ? j.results : [];
-
   const pantrySpecific = pantry.filter(p => !GENERIC_WORDS.has(p));
 
   const filtered = raw.filter(it => {
     const title = String(it.title||"").toLowerCase();
     const dishTypes = (it.dishTypes || []).map(d => String(d).toLowerCase());
+
     if (titleHasAny(title,DESSERT_WORDS)) return false;
     if (titleHasAny(title,DRINK_WORDS))   return false;
     if (titleHasAny(title,ALCOHOL_WORDS)) return false;
@@ -163,9 +200,10 @@ async function spoonacularRecipes(pantry, prefs){
     if (pantrySpecific.length > 0 && !hasSpecificTermInTitleOrIngredients(it, pantrySpecific)) return false;
 
     if (title.includes("macaroni and cheese")){
-      const hasDairy = pantry.some(p => ["cheese","milk","cream"].includes(p));
+      const hasDairy = pantry.some(p => ["cheese","milk","cream","yogurt"].includes(p));
       if (!hasDairy) return false;
     }
+
     if ((/shrimp|prawn|salmon|tuna|anchovy|sardine/).test(title) &&
         !pantry.some(p => ["shrimp","prawn","salmon","tuna","fish"].includes(p)))
       return false;
@@ -185,10 +223,10 @@ async function spoonacularRecipes(pantry, prefs){
       energy: "hob",
       cost: 2.5,
       score: Math.round(score*100)/100,
-      ingredients: (it.extendedIngredients || []).map(ing => ({
-        name: String(ing.name||"").toLowerCase(),
-        have: pantry.includes(String(ing.name||"").toLowerCase())
-      })),
+      ingredients: (it.extendedIngredients || []).map(ing => {
+        const nm = String(ing.name||"").toLowerCase();
+        return { name: nm, have: pantry.includes(nm) };
+      }),
       steps: ((it.analyzedInstructions?.[0]?.steps)||[]).map((s,i)=>({ id:`${it.id}-s${i}`, text:s.step })),
       badges: ["web"],
     };
@@ -197,34 +235,63 @@ async function spoonacularRecipes(pantry, prefs){
   return { results: scored, extra: { spoonacularRawCount: raw.length, kept: scored.length, timeCap } };
 }
 
-// ---------- LLM fallback (savory + seasoned) ----------
+// ---------- LLM fallback (savory + seasoned, 3s cap) ----------
+function buildPrompt(pantry, prefs) {
+  const core = pantry.join(", ");
+  const minutes  = Math.min(Math.max(prefs?.time || 25, 10), 40);
+  const servings = Math.min(Math.max(prefs?.servings || 2, 1), 6);
+  const diet     = prefs?.diet || "none";
+  const energy   = prefs?.energyMode || "hob";
+
+  return `
+Create ONE savoury DINNER recipe (no drinks, no desserts, no sweets) using primarily: ${core}.
+Assume common staples available: salt, pepper, oil, stock cube/paste, onion, garlic, chilli, ginger, smoked paprika,
+curry powder, dried herbs, soy sauce, lemon/lime, vinegar.
+Ensure flavour: include aromatics (onion/garlic/ginger), an acid or freshness (lemon/lime/soy), and at least 3 seasonings from the staples.
+Constraints:
+- Ready in <= ${minutes} minutes
+- Servings: ${servings}
+- Diet: ${diet}
+- Cooking method prefers: ${energy}
+
+Return JSON with:
+{
+  "id": "llm-<some-id>",
+  "title": "...",
+  "time": ${minutes},
+  "cost": 3,
+  "energy": "${energy}",
+  "ingredients": [{"name":"...", "have": true|false}, ...],
+  "steps": [{"id":"s1","text":"..."}, ...],
+  "badges": ["under-30","budget"]
+}
+Only return JSON.`;
+}
+
 async function llmRecipe(pantry, prefs){
   if(!OPENAI_API_KEY) return { recipe:null, reasonNoLLM:"OPENAI_API_KEY missing" };
 
-  const system = `You are “DinnerSnap”, a practical 20-minute weeknight cook.
-Output a **savory main** (NOT dessert or drink). Season boldly with cupboard items: salt, pepper, garlic, onion,
-ginger, chilli, smoked paprika, cumin, curry powder, dried herbs, stock cube, soy sauce, lemon, vinegar, olive oil.
-Keep it simple (5–8 steps), minimal pans, everyday UK measurements.`;
-
-  const user = `Pantry: ${pantry.join(", ")}
-Diet: ${prefs?.diet ?? "none"}
-Energy: ${prefs?.energyMode ?? "hob"}
-Budget: ~£${prefs?.budget ?? 3}/serv
-Time: ≤${prefs?.time ?? 25} min
-
-Return **ONLY JSON** with keys:
-title, time, cost, energy, ingredients[{name,have}], steps[{id,text}], badges[]`;
+  const body = {
+    model: "gpt-4o-mini",
+    temperature: 0.45,
+    max_tokens: 600,
+    messages: [
+      { role: "system", content: "You are a skilled home cook who writes concise, savoury DINNER recipes only." },
+      { role: "user", content: buildPrompt(pantry, prefs) }
+    ]
+  };
 
   try{
-    const r = await fetch("https://api.openai.com/v1/chat/completions",{
-      method:"POST",
-      headers:{ "content-type":"application/json", authorization:`Bearer ${OPENAI_API_KEY}` },
-      body: JSON.stringify({
-        model:"gpt-4o-mini",
-        temperature:0.4,
-        messages:[{role:"system",content:system},{role:"user",content:user}]
-      })
-    });
+    const r = await tfetch(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        method:"POST",
+        headers:{ "content-type":"application/json", authorization:`Bearer ${OPENAI_API_KEY}` },
+        body: JSON.stringify(body)
+      },
+      3000, // 3s cap
+      "llm timeout"
+    );
     const j = await r.json();
     const txt = j?.choices?.[0]?.message?.content || "";
     const m = txt.match(/\{[\s\S]*\}$/);
@@ -235,10 +302,10 @@ title, time, cost, energy, ingredients[{name,have}], steps[{id,text}], badges[]`
     parsed.energy = parsed.energy || "hob";
     parsed.cost = parsed.cost ?? 2.0;
     parsed.badges = Array.isArray(parsed.badges) ? parsed.badges : ["llm"];
-    parsed.ingredients = (parsed.ingredients||[]).map(i => ({
-      name: String(i.name||"").toLowerCase(),
-      have: pantry.includes(String(i.name||"").toLowerCase())
-    }));
+    parsed.ingredients = (parsed.ingredients||[]).map(i => {
+      const nm = String(i.name||"").toLowerCase();
+      return { name: nm, have: pantry.includes(nm) };
+    });
     parsed.steps = (parsed.steps||[]).map((s,i)=>({ id: s.id || `step-${i}`, text: s.text || String(s) }));
     return { recipe: parsed };
   }catch(e){
@@ -252,20 +319,22 @@ function emergencyRecipe(pantry){
   if (pantry.some(p => p.includes("chickpea"))) titleBits.push("Chickpea");
   if (pantry.includes("coconut cream")) titleBits.push("Coconut");
   if (pantry.some(p => PASTA_WORDS.has(p))) titleBits.push("Spaghetti");
-  const title = (titleBits.length ? titleBits.join(" ") : "Pantry") + " Savory Skillet";
+  const title = (titleBits.length ? titleBits.join(" ") : "Pantry") + " Savoury Skillet";
 
   const ings = [
     ...pantry.map(p => ({ name: p, have: true })),
     { name:"onion (or onion powder)", have:false },
     { name:"garlic (or garlic powder)", have:false },
+    { name:"ginger (or ground ginger)", have:false },
     { name:"mixed dried herbs", have:false },
     { name:"stock cube", have:false },
+    { name:"lemon or vinegar", have:false },
     { name:"salt & black pepper", have:false }
   ];
   const steps = [
-    { id:"s1", text:"Heat oil in a pan; add onion & garlic. Cook 2–3 min." },
-    { id:"s2", text:"Add pantry items (e.g., chickpeas, coconut cream, chopped any veg). Stir." },
-    { id:"s3", text:"Season with herbs, stock cube, salt & pepper; add splash of pasta water if using spaghetti." },
+    { id:"s1", text:"Heat oil; add onion, garlic & ginger. Cook 2–3 min." },
+    { id:"s2", text:"Add pantry items (e.g., chickpeas, coconut cream, any chopped veg). Stir." },
+    { id:"s3", text:"Season with herbs, stock, salt & pepper; add splash of pasta water if using spaghetti." },
     { id:"s4", text:"Simmer 6–8 min to thicken. Toss with cooked spaghetti or serve over rice." }
   ];
   return { id:`local-${Date.now()}`, title, time:15, cost:2.0, energy:"hob", ingredients:ings, steps, badges:["local"] };
@@ -279,32 +348,38 @@ export default async function handler(req){
   const { imageBase64, pantryOverride, prefs = {} } = body || {};
   let pantry = [], source = "", pantryFrom = {};
 
+  // Source selection + Vision with timeout
   if (Array.isArray(pantryOverride) && pantryOverride.length){
     pantry = cleanPantry(pantryOverride);
     source = "pantryOverride";
   } else if (imageBase64){
-    const res = await callVision(imageBase64);
-    pantryFrom = { ocr: res.ocrTokens, labels: res.labels, objects: res.objects };
-    const combined = [...(res.ocrTokens||[]), ...(res.labels||[]), ...(res.objects||[])];
-    pantry = cleanPantry(combined);
-    source = "vision";
+    try {
+      const res = await withTimeout(
+        () => callVision(imageBase64),
+        3500,
+        "vision timeout"
+      );
+      pantryFrom = { ocr: res.ocrTokens, labels: res.labels, objects: res.objects };
+      const combined = [...(res.ocrTokens||[]), ...(res.labels||[]), ...(res.objects||[])];
+      pantry = cleanPantry(combined);
+      source = "vision";
+    } catch (e) {
+      // Vision timed out/failed → still let user continue; pantry will be empty here
+      pantry = cleanPantry([]);
+      source = "vision-failed";
+      pantryFrom = { error: String(e?.message||e) };
+    }
   } else {
     return json(400,{error:"imageBase64 required (or pantryOverride)"});
   }
 
-  // SPOONACULAR
+  // SPOONACULAR (2.5s)
   const sp = await spoonacularRecipes(pantry, prefs);
   let recipes = sp.results || [];
 
-  // promote LLM when web is empty/weak
-  const needLLM = recipes.length === 0 ||
-    titleHasAny(recipes[0]?.title, DESSERT_WORDS) ||
-    titleHasAny(recipes[0]?.title, DRINK_WORDS) ||
-    titleHasAny(recipes[0]?.title, ALCOHOL_WORDS);
-
+  // LLM fallback (3s) if Spoon returned none (or got filtered to none)
   let usedLLM = false, llmTried = false, llmError = null, reasonNoLLM = null;
-
-  if (needLLM){
+  if (recipes.length === 0) {
     llmTried = true;
     const llm = await llmRecipe(pantry, prefs);
     if (llm.reasonNoLLM) reasonNoLLM = llm.reasonNoLLM;
@@ -325,6 +400,6 @@ export default async function handler(req){
     usedLLM, llmTried, llmError, reasonNoLLM
   };
 
-  console.log("analyze debug:", debug); // shows in Vercel logs (Node runtime)
+  console.log("analyze debug:", debug);
   return json(200, { pantry, recipes, debug });
 }
