@@ -6,7 +6,7 @@ export const config = {
   runtime: "nodejs",   // IMPORTANT: nodejs (not edge)
   maxDuration: 25,
   memory: 1024,
-  regions: ["lhr1"],   // London (optional; you can remove if you prefer auto)
+  regions: ["lhr1"],   // London (optional; remove if you prefer auto)
 };
 
 // --- Env keys ---
@@ -21,7 +21,7 @@ const json = (status, obj) =>
     headers: { "content-type": "application/json" },
   });
 
-// Abort/timeout helpers
+// ---- timeouts (hard caps so the function never hits Vercel's overall limit) ----
 function withTimeout(promiseFn, ms, label = "timeout") {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
@@ -82,7 +82,7 @@ async function callVision(imageBase64) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     },
-    3500,
+    3500, // <-- A) Vision capped at 3.5s
     "vision timeout"
   );
   const j = await r.json();
@@ -93,7 +93,7 @@ async function callVision(imageBase64) {
   const RAW_TOKENS = ocrRaw
     .split(/[^a-z]+/g)
     .map((t) => t.trim())
-    .filter((t) => t.length >= 4); // ignore tiny tokens like "uk", "so"
+    .filter((t) => t.length >= 4); // ignore tiny tokens
 
   const FOODISH_HINTS = new Set([
     "ingredients","organic","sauce","soup","canned","tin","dried","fresh","frozen",
@@ -132,7 +132,7 @@ const MAP = {
   tomato: "tomatoes",
   onions: "onion",
   eggs: "egg",
-  brockley: "broccoli", // your observed typo
+  brockley: "broccoli", // observed typo
 };
 function uniqLower(a){const s=new Set();for(const x of a)s.add(String(x).toLowerCase());return [...s];}
 function lev(a,b){const m=[];for(let i=0;i<=b.length;i++)m[i]=[i];for(let j=0;j<=a.length;j++)m[0][j]=j;for(let i=1;i<=b.length;i++){for(let j=1;j<=a.length;j++){m[i][j]=Math.min(m[i-1][j]+1,m[i][j-1]+1,m[i-1][j-1]+(b.charAt(i-1)===a.charAt(j-1)?0:1));}}return m[b.length][a.length];}
@@ -166,14 +166,14 @@ async function spoonacularRecipes(pantry, prefs){
   url.searchParams.set("sort", "max-used-ingredients");
   url.searchParams.set("number", "18");
   url.searchParams.set("ignorePantry", "true");
-  url.searchParams.set("type", "main course");                 // <- dinner only
+  url.searchParams.set("type", "main course");                 // dinner only
   url.searchParams.set("excludeIngredients", Array.from(ALCOHOL_WORDS).join(",")); // no alcohol
   url.searchParams.set("maxReadyTime", String(timeCap));
   if(!hasMeat) url.searchParams.set("diet", "vegetarian");
 
   let j = {};
   try {
-    const r = await tfetch(url.toString(), {}, 2500, "spoonacular timeout"); // 2.5s cap
+    const r = await tfetch(url.toString(), {}, 2500, "spoonacular timeout"); // <-- B) 2.5s cap
     j = await r.json();
   } catch(e) {
     return { results: [], extra: { error: String(e?.message||e) } };
@@ -289,7 +289,7 @@ async function llmRecipe(pantry, prefs){
         headers:{ "content-type":"application/json", authorization:`Bearer ${OPENAI_API_KEY}` },
         body: JSON.stringify(body)
       },
-      3000, // 3s cap
+      3000, // <-- C) LLM capped at 3s
       "llm timeout"
     );
     const j = await r.json();
