@@ -1,11 +1,13 @@
 // api/analyze.js
-// Fast path: Vision (<=2.2s) -> PARALLEL (Spoonacular <=1.5s, LLM <=1.8s) -> emergency fallback
+// Wall-clock budget: <= ~7s total. Anything slow gets skipped; you still get a result.
 export const config = {
   runtime: "nodejs",
   maxDuration: 25,
   memory: 1024,
-  // regions: ["lhr1"], // remove pin to avoid capacity hiccups; let Vercel choose
+  // no region pin; let Vercel choose capacity
 };
+
+const BUDGET_MS = 7000; // total wall-clock budget
 
 const GCV_KEY = process.env.GCV_KEY;
 const SPOON_KEY = process.env.SPOON_KEY || process.env.SPOONACULAR_KEY;
@@ -14,7 +16,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const json = (status, obj) =>
   new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
 
-// ---------- timing helpers ----------
+// ---------- time + fetch helpers ----------
 function withTimeout(promiseFn, ms, label = "timeout") {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
@@ -23,9 +25,11 @@ function withTimeout(promiseFn, ms, label = "timeout") {
     new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms + 5)),
   ]).finally(() => clearTimeout(t));
 }
-
 const tfetch = (url, opts = {}, ms = 3000, label = `fetch timeout ${ms}ms`) =>
   withTimeout((signal) => fetch(url, { ...opts, signal }), ms, label);
+
+const now = () => Date.now();
+const timeLeft = (start, budget) => Math.max(0, budget - (now() - start));
 
 // ---------- classifiers / utilities ----------
 const DESSERT_WORDS = new Set([
@@ -44,18 +48,23 @@ const titleHasAny = (title, set) => {
   for (const w of set) if (t.includes(w)) return true;
   return false;
 };
-
 const hasSpecificTermInTitleOrIngredients = (item, specificTerms) => {
   const t = String(item.title || "").toLowerCase();
   const ings = (item.extendedIngredients || []).map(i => String(i.name || "").toLowerCase());
   return specificTerms.some(p => t.includes(p) || ings.some(n => n.includes(p)));
 };
 
-// ---------- Vision (<=2.2s cap) ----------
-async function callVision(imageBase64) {
+// ---------- body parsing with timeout ----------
+async function readBodyJson(req, ms) {
+  const txt = await withTimeout(() => req.text(), ms, "body read timeout");
+  try { return JSON.parse(txt); } catch { throw new Error("invalid JSON"); }
+}
+
+// ---------- Vision (cap by remaining time) ----------
+async function callVision(imageBase64, ms) {
   const body = {
     requests: [{
-      image: { content: imageBase64.replace(/^data:image\/\w+;base64,/, "") },
+      image: { content: String(imageBase64 || "").replace(/^data:image\/\w+;base64,/, "") },
       features: [
         { type: "TEXT_DETECTION", maxResults: 1 },
         { type: "LABEL_DETECTION", maxResults: 10 },
@@ -67,7 +76,7 @@ async function callVision(imageBase64) {
   const r = await tfetch(
     `https://vision.googleapis.com/v1/images:annotate?key=${GCV_KEY}`,
     { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
-    2200,
+    ms,
     "vision timeout"
   );
   const j = await r.json();
@@ -128,8 +137,8 @@ function cleanPantry(rawTerms){
   return [...out];
 }
 
-// ---------- Spoonacular (<=1.5s, filter nonsense) ----------
-async function spoonacularRecipes(pantry, prefs){
+// ---------- Spoonacular (filter nonsense) ----------
+async function spoonacularRecipes(pantry, prefs, ms){
   if(!SPOON_KEY) return { results: [], extra:{ note:"no SPOON_KEY" } };
 
   const hasMeat = pantry.some(p => MEAT_WORDS.has(p));
@@ -151,7 +160,7 @@ async function spoonacularRecipes(pantry, prefs){
 
   let j = {};
   try {
-    const r = await tfetch(url.toString(), {}, 1500, "spoonacular timeout"); // 1.5s cap
+    const r = await tfetch(url.toString(), {}, ms, "spoonacular timeout");
     j = await r.json();
   } catch(e) {
     return { results: [], extra: { error: String(e?.message||e) } };
@@ -211,7 +220,7 @@ async function spoonacularRecipes(pantry, prefs){
   return { results: scored, extra: { spoonacularRawCount: raw.length, kept: scored.length, timeCap } };
 }
 
-// ---------- LLM fallback (<=1.8s, seasoned, dinner-only) ----------
+// ---------- LLM fallback (dinner-only, seasoned) ----------
 function buildPrompt(pantry, prefs) {
   const core = pantry.join(", ");
   const minutes  = Math.min(Math.max(prefs?.time || 25, 10), 35);
@@ -238,7 +247,7 @@ Return ONLY JSON:
  "badges":["under-30","budget"]}`;
 }
 
-async function llmRecipe(pantry, prefs){
+async function llmRecipe(pantry, prefs, ms){
   if(!OPENAI_API_KEY) return { recipe:null, reasonNoLLM:"OPENAI_API_KEY missing" };
 
   const body = {
@@ -254,12 +263,10 @@ async function llmRecipe(pantry, prefs){
   try{
     const r = await tfetch(
       "https://api.openai.com/v1/chat/completions",
-      {
-        method:"POST",
+      { method:"POST",
         headers:{ "content-type":"application/json", authorization:`Bearer ${OPENAI_API_KEY}` },
-        body: JSON.stringify(body)
-      },
-      1800, // 1.8s cap
+        body: JSON.stringify(body) },
+      ms,
       "llm timeout"
     );
     const j = await r.json();
@@ -310,41 +317,65 @@ function emergencyRecipe(pantry){
   return { id:`local-${Date.now()}`, title, time:15, cost:2.0, energy:"hob", ingredients:ings, steps, badges:["local"] };
 }
 
-// ---------- handler (PARALLEL external calls) ----------
+// ---------- handler with wall-clock budget ----------
 export default async function handler(req){
+  const started = now();
+
   if (req.method !== "POST") return json(405,{error:"POST only"});
-  let body; try{ body = await req.json(); } catch{ return json(400,{error:"invalid JSON"}); }
+
+  // Body read capped to 2s
+  let body;
+  try { body = await readBodyJson(req, 2000); }
+  catch (e) { return json(400, { error: String(e?.message||e) }); }
 
   const { imageBase64, pantryOverride, prefs = {} } = body || {};
   let pantry = [], source = "", pantryFrom = {};
 
+  // Vision (only if we still have time)
   if (Array.isArray(pantryOverride) && pantryOverride.length){
     pantry = cleanPantry(pantryOverride);
     source = "pantryOverride";
   } else if (imageBase64){
-    try {
-      const res = await withTimeout(() => callVision(imageBase64), 2200, "vision timeout");
-      pantryFrom = { ocr: res.ocrTokens, labels: res.labels, objects: res.objects };
-      const combined = [...(res.ocrTokens||[]), ...(res.labels||[]), ...(res.objects||[])];
-      pantry = cleanPantry(combined);
-      source = "vision";
-    } catch (e) {
-      pantry = cleanPantry([]); // allow progress
-      source = "vision-failed";
-      pantryFrom = { error: String(e?.message||e) };
+    const msLeft = timeLeft(started, BUDGET_MS) - 450; // keep a little margin
+    if (msLeft > 300) {
+      try {
+        const res = await callVision(imageBase64, Math.min(2000, msLeft));
+        pantryFrom = { ocr: res.ocrTokens, labels: res.labels, objects: res.objects };
+        const combined = [...(res.ocrTokens||[]), ...(res.labels||[]), ...(res.objects||[])];
+        pantry = cleanPantry(combined);
+        source = "vision";
+      } catch (e) {
+        pantry = cleanPantry([]);
+        source = "vision-failed";
+        pantryFrom = { error: String(e?.message||e) };
+      }
+    } else {
+      pantry = cleanPantry([]);
+      source = "vision-skipped";
     }
   } else {
     return json(400,{error:"imageBase64 required (or pantryOverride)"});
   }
 
-  // Kick both providers in PARALLEL
-  const pSpoon = spoonacularRecipes(pantry, prefs);
-  const pLLM   = llmRecipe(pantry, prefs);
+  // If we’re out of time already, return emergency
+  if (timeLeft(started, BUDGET_MS) < 250) {
+    const fallback = emergencyRecipe(pantry);
+    console.log("analyze debug:", { source, pantryFrom, cleanedPantry: pantry, emergencyEarly: true });
+    return json(200, { pantry, recipes: [fallback], debug: { source, pantryFrom, cleanedPantry: pantry, emergencyEarly: true } });
+  }
 
-  let spoon = await pSpoon; // resolve both; each has internal caps
-  let llm   = await pLLM;
+  // Fire providers in parallel with caps based on remaining time
+  const left = timeLeft(started, BUDGET_MS);
+  const spoonMs = Math.min(1200, Math.max(500, left - 700)); // leave space to finish
+  const llmMs   = Math.min(1600, Math.max(600, left - 600));
 
-  // Choose best available quickly
+  const pSpoon = spoonacularRecipes(pantry, prefs, spoonMs);
+  const pLLM   = llmRecipe(pantry, prefs, llmMs);
+
+  const [spoonRes, llmRes] = await Promise.allSettled([pSpoon, pLLM]);
+  const spoon = spoonRes.status === "fulfilled" ? spoonRes.value : { results: [], extra: { error: "spoon failed" } };
+  const llm   = llmRes.status   === "fulfilled" ? llmRes.value   : { recipe: null, llmError: "llm failed" };
+
   let recipes = [];
   if (Array.isArray(spoon.results) && spoon.results.length) {
     recipes = spoon.results;
@@ -358,15 +389,12 @@ export default async function handler(req){
     source,
     pantryFrom,
     cleanedPantry: pantry,
-    extra: {
-      spoonacularRawCount: spoon.extra?.spoonacularRawCount,
-      kept: spoon.extra?.kept,
-      timeCap: spoon.extra?.timeCap
-    },
+    extra: { spoonacularRawCount: spoon.extra?.spoonacularRawCount, kept: spoon.extra?.kept, timeCap: spoon.extra?.timeCap },
     usedLLM: !!llm.recipe,
     llmTried: !!OPENAI_API_KEY,
     llmError: llm.llmError || null,
-    reasonNoLLM: llm.reasonNoLLM || null
+    reasonNoLLM: llm.reasonNoLLM || null,
+    totalMs: (now() - started)
   };
 
   console.log("analyze debug:", debug);
