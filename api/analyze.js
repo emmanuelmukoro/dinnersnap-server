@@ -1,27 +1,20 @@
 // api/analyze.js
-// Vision → cleaned pantry → Spoonacular (dinner-only, filtered) → LLM fallback (seasoned) → Emergency local
-
-// --- Vercel runtime config ---
+// Fast path: Vision (<=2.2s) -> PARALLEL (Spoonacular <=1.5s, LLM <=1.8s) -> emergency fallback
 export const config = {
-  runtime: "nodejs",   // IMPORTANT: nodejs (not edge)
+  runtime: "nodejs",
   maxDuration: 25,
   memory: 1024,
-  regions: ["lhr1"],   // London (optional; remove if you prefer auto)
+  // regions: ["lhr1"], // remove pin to avoid capacity hiccups; let Vercel choose
 };
 
-// --- Env keys ---
 const GCV_KEY = process.env.GCV_KEY;
 const SPOON_KEY = process.env.SPOON_KEY || process.env.SPOONACULAR_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// --- Small helpers ---
 const json = (status, obj) =>
-  new Response(JSON.stringify(obj), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
+  new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
 
-// ---- timeouts (hard caps so the function never hits Vercel's overall limit) ----
+// ---------- timing helpers ----------
 function withTimeout(promiseFn, ms, label = "timeout") {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
@@ -31,15 +24,10 @@ function withTimeout(promiseFn, ms, label = "timeout") {
   ]).finally(() => clearTimeout(t));
 }
 
-async function tfetch(url, opts = {}, ms = 3000, label = `fetch timeout ${ms}ms`) {
-  return withTimeout(
-    (signal) => fetch(url, { ...opts, signal }),
-    ms,
-    label
-  );
-}
+const tfetch = (url, opts = {}, ms = 3000, label = `fetch timeout ${ms}ms`) =>
+  withTimeout((signal) => fetch(url, { ...opts, signal }), ms, label);
 
-// ---------- classifiers ----------
+// ---------- classifiers / utilities ----------
 const DESSERT_WORDS = new Set([
   "dessert","pudding","ice cream","smoothie","shake","cookie","brownie","cupcake",
   "cake","muffin","pancake","waffle","jam","jelly","compote","truffle","fudge",
@@ -51,18 +39,19 @@ const GENERIC_WORDS = new Set(["pasta","rice","bread","flour","sugar","oil","sal
 const MEAT_WORDS = new Set(["chicken","beef","pork","lamb","bacon","ham","turkey","shrimp","prawn","salmon","tuna","fish"]);
 const PASTA_WORDS = new Set(["pasta","spaghetti","macaroni","penne","farfalle","orzo","fusilli","linguine","tagliatelle"]);
 
-function titleHasAny(title, set) {
+const titleHasAny = (title, set) => {
   const t = String(title || "").toLowerCase();
   for (const w of set) if (t.includes(w)) return true;
   return false;
-}
-function hasSpecificTermInTitleOrIngredients(item, specificTerms) {
+};
+
+const hasSpecificTermInTitleOrIngredients = (item, specificTerms) => {
   const t = String(item.title || "").toLowerCase();
   const ings = (item.extendedIngredients || []).map(i => String(i.name || "").toLowerCase());
   return specificTerms.some(p => t.includes(p) || ings.some(n => n.includes(p)));
-}
+};
 
-// ---------- Vision (with OCR/labels/objects and time cap) ----------
+// ---------- Vision (<=2.2s cap) ----------
 async function callVision(imageBase64) {
   const body = {
     requests: [{
@@ -77,37 +66,26 @@ async function callVision(imageBase64) {
 
   const r = await tfetch(
     `https://vision.googleapis.com/v1/images:annotate?key=${GCV_KEY}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    },
-    3500, // <-- A) Vision capped at 3.5s
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
+    2200,
     "vision timeout"
   );
   const j = await r.json();
   const res = j?.responses?.[0] || {};
 
-  // OCR tokens (aggressive cleanup)
+  // OCR → foodish tokens
   const ocrRaw = (res.textAnnotations?.[0]?.description || "").toLowerCase();
-  const RAW_TOKENS = ocrRaw
-    .split(/[^a-z]+/g)
-    .map((t) => t.trim())
-    .filter((t) => t.length >= 4); // ignore tiny tokens
-
+  const RAW_TOKENS = ocrRaw.split(/[^a-z]+/g).map(t => t.trim()).filter(t => t.length >= 4);
   const FOODISH_HINTS = new Set([
     "ingredients","organic","sauce","soup","canned","tin","dried","fresh","frozen",
     "beans","peas","lentils","broccoli","banana","tomato","onion","garlic","squash",
     "chickpea","chickpeas","feta","rice","pasta","spaghetti","oats","milk","yogurt","cheese",
     "lemon","orange","pepper","spinach","mushroom","potato","avocado","coconut","cream"
   ]);
-
-  // keep token if it looks food-ish
   const ocrTokens = RAW_TOKENS.filter(t => FOODISH_HINTS.has(t));
 
   const labels  = (res.labelAnnotations || []).map(x => x.description?.toLowerCase()).filter(Boolean);
   const objects = (res.localizedObjectAnnotations || []).map(x => x.name?.toLowerCase()).filter(Boolean);
-
   return { ocrTokens, labels, objects };
 }
 
@@ -132,11 +110,11 @@ const MAP = {
   tomato: "tomatoes",
   onions: "onion",
   eggs: "egg",
-  brockley: "broccoli", // observed typo
+  brockley: "broccoli",
 };
-function uniqLower(a){const s=new Set();for(const x of a)s.add(String(x).toLowerCase());return [...s];}
+const uniqLower = (a) => { const s = new Set(); for (const x of a) s.add(String(x).toLowerCase()); return [...s]; };
 function lev(a,b){const m=[];for(let i=0;i<=b.length;i++)m[i]=[i];for(let j=0;j<=a.length;j++)m[0][j]=j;for(let i=1;i<=b.length;i++){for(let j=1;j<=a.length;j++){m[i][j]=Math.min(m[i-1][j]+1,m[i][j-1]+1,m[i-1][j-1]+(b.charAt(i-1)===a.charAt(j-1)?0:1));}}return m[b.length][a.length];}
-function nearestWhitelistStrict(term){let best=null,bestDist=2;for(const w of WHITELIST){const d=lev(term,w);if(d<bestDist){bestDist=d;best=w;}}return bestDist<=1?best:null;}
+const nearestWhitelistStrict = (term) => { let best=null,bestDist=2; for (const w of WHITELIST){const d=lev(term,w); if(d<bestDist){bestDist=d;best=w;}} return bestDist<=1?best:null; };
 function cleanPantry(rawTerms){
   const out=new Set();
   for(const tRaw of uniqLower(rawTerms)){
@@ -150,7 +128,7 @@ function cleanPantry(rawTerms){
   return [...out];
 }
 
-// ---------- Spoonacular (dinner-mode, 2.5s cap, filter nonsense) ----------
+// ---------- Spoonacular (<=1.5s, filter nonsense) ----------
 async function spoonacularRecipes(pantry, prefs){
   if(!SPOON_KEY) return { results: [], extra:{ note:"no SPOON_KEY" } };
 
@@ -166,14 +144,14 @@ async function spoonacularRecipes(pantry, prefs){
   url.searchParams.set("sort", "max-used-ingredients");
   url.searchParams.set("number", "18");
   url.searchParams.set("ignorePantry", "true");
-  url.searchParams.set("type", "main course");                 // dinner only
-  url.searchParams.set("excludeIngredients", Array.from(ALCOHOL_WORDS).join(",")); // no alcohol
+  url.searchParams.set("type", "main course");
+  url.searchParams.set("excludeIngredients", Array.from(ALCOHOL_WORDS).join(","));
   url.searchParams.set("maxReadyTime", String(timeCap));
   if(!hasMeat) url.searchParams.set("diet", "vegetarian");
 
   let j = {};
   try {
-    const r = await tfetch(url.toString(), {}, 2500, "spoonacular timeout"); // <-- B) 2.5s cap
+    const r = await tfetch(url.toString(), {}, 1500, "spoonacular timeout"); // 1.5s cap
     j = await r.json();
   } catch(e) {
     return { results: [], extra: { error: String(e?.message||e) } };
@@ -203,10 +181,8 @@ async function spoonacularRecipes(pantry, prefs){
       const hasDairy = pantry.some(p => ["cheese","milk","cream","yogurt"].includes(p));
       if (!hasDairy) return false;
     }
-
     if ((/shrimp|prawn|salmon|tuna|anchovy|sardine/).test(title) &&
-        !pantry.some(p => ["shrimp","prawn","salmon","tuna","fish"].includes(p)))
-      return false;
+        !pantry.some(p => ["shrimp","prawn","salmon","tuna","fish"].includes(p))) return false;
 
     return true;
   });
@@ -235,37 +211,31 @@ async function spoonacularRecipes(pantry, prefs){
   return { results: scored, extra: { spoonacularRawCount: raw.length, kept: scored.length, timeCap } };
 }
 
-// ---------- LLM fallback (savory + seasoned, 3s cap) ----------
+// ---------- LLM fallback (<=1.8s, seasoned, dinner-only) ----------
 function buildPrompt(pantry, prefs) {
   const core = pantry.join(", ");
-  const minutes  = Math.min(Math.max(prefs?.time || 25, 10), 40);
+  const minutes  = Math.min(Math.max(prefs?.time || 25, 10), 35);
   const servings = Math.min(Math.max(prefs?.servings || 2, 1), 6);
   const diet     = prefs?.diet || "none";
   const energy   = prefs?.energyMode || "hob";
 
   return `
-Create ONE savoury DINNER recipe (no drinks, no desserts, no sweets) using primarily: ${core}.
-Assume common staples available: salt, pepper, oil, stock cube/paste, onion, garlic, chilli, ginger, smoked paprika,
+Create ONE savoury DINNER recipe (no drinks/desserts/sweets) using primarily: ${core}.
+Assume staples: salt, pepper, oil, stock cube/paste, onion, garlic, chilli, ginger, smoked paprika,
 curry powder, dried herbs, soy sauce, lemon/lime, vinegar.
-Ensure flavour: include aromatics (onion/garlic/ginger), an acid or freshness (lemon/lime/soy), and at least 3 seasonings from the staples.
+Ensure flavour: aromatics (onion/garlic/ginger), an acid or freshness (lemon/lime/soy),
+and at least 3 seasonings from the staples if not already in pantry.
 Constraints:
 - Ready in <= ${minutes} minutes
 - Servings: ${servings}
 - Diet: ${diet}
 - Cooking method prefers: ${energy}
 
-Return JSON with:
-{
-  "id": "llm-<some-id>",
-  "title": "...",
-  "time": ${minutes},
-  "cost": 3,
-  "energy": "${energy}",
-  "ingredients": [{"name":"...", "have": true|false}, ...],
-  "steps": [{"id":"s1","text":"..."}, ...],
-  "badges": ["under-30","budget"]
-}
-Only return JSON.`;
+Return ONLY JSON:
+{"id":"llm-<id>","title":"...","time":${minutes},"cost":3,"energy":"${energy}",
+ "ingredients":[{"name":"...","have":true|false},...],
+ "steps":[{"id":"s1","text":"..."},...],
+ "badges":["under-30","budget"]}`;
 }
 
 async function llmRecipe(pantry, prefs){
@@ -289,7 +259,7 @@ async function llmRecipe(pantry, prefs){
         headers:{ "content-type":"application/json", authorization:`Bearer ${OPENAI_API_KEY}` },
         body: JSON.stringify(body)
       },
-      3000, // <-- C) LLM capped at 3s
+      1800, // 1.8s cap
       "llm timeout"
     );
     const j = await r.json();
@@ -313,7 +283,7 @@ async function llmRecipe(pantry, prefs){
   }
 }
 
-// ---------- Emergency local (never-empty) ----------
+// ---------- Emergency local ----------
 function emergencyRecipe(pantry){
   const titleBits = [];
   if (pantry.some(p => p.includes("chickpea"))) titleBits.push("Chickpea");
@@ -334,13 +304,13 @@ function emergencyRecipe(pantry){
   const steps = [
     { id:"s1", text:"Heat oil; add onion, garlic & ginger. Cook 2–3 min." },
     { id:"s2", text:"Add pantry items (e.g., chickpeas, coconut cream, any chopped veg). Stir." },
-    { id:"s3", text:"Season with herbs, stock, salt & pepper; add splash of pasta water if using spaghetti." },
-    { id:"s4", text:"Simmer 6–8 min to thicken. Toss with cooked spaghetti or serve over rice." }
+    { id:"s3", text:"Season with herbs, stock, salt & pepper; splash of pasta water if using spaghetti." },
+    { id:"s4", text:"Simmer 6–8 min. Toss with cooked spaghetti or serve over rice." }
   ];
   return { id:`local-${Date.now()}`, title, time:15, cost:2.0, energy:"hob", ingredients:ings, steps, badges:["local"] };
 }
 
-// ---------- handler ----------
+// ---------- handler (PARALLEL external calls) ----------
 export default async function handler(req){
   if (req.method !== "POST") return json(405,{error:"POST only"});
   let body; try{ body = await req.json(); } catch{ return json(400,{error:"invalid JSON"}); }
@@ -348,24 +318,18 @@ export default async function handler(req){
   const { imageBase64, pantryOverride, prefs = {} } = body || {};
   let pantry = [], source = "", pantryFrom = {};
 
-  // Source selection + Vision with timeout
   if (Array.isArray(pantryOverride) && pantryOverride.length){
     pantry = cleanPantry(pantryOverride);
     source = "pantryOverride";
   } else if (imageBase64){
     try {
-      const res = await withTimeout(
-        () => callVision(imageBase64),
-        3500,
-        "vision timeout"
-      );
+      const res = await withTimeout(() => callVision(imageBase64), 2200, "vision timeout");
       pantryFrom = { ocr: res.ocrTokens, labels: res.labels, objects: res.objects };
       const combined = [...(res.ocrTokens||[]), ...(res.labels||[]), ...(res.objects||[])];
       pantry = cleanPantry(combined);
       source = "vision";
     } catch (e) {
-      // Vision timed out/failed → still let user continue; pantry will be empty here
-      pantry = cleanPantry([]);
+      pantry = cleanPantry([]); // allow progress
       source = "vision-failed";
       pantryFrom = { error: String(e?.message||e) };
     }
@@ -373,22 +337,20 @@ export default async function handler(req){
     return json(400,{error:"imageBase64 required (or pantryOverride)"});
   }
 
-  // SPOONACULAR (2.5s)
-  const sp = await spoonacularRecipes(pantry, prefs);
-  let recipes = sp.results || [];
+  // Kick both providers in PARALLEL
+  const pSpoon = spoonacularRecipes(pantry, prefs);
+  const pLLM   = llmRecipe(pantry, prefs);
 
-  // LLM fallback (3s) if Spoon returned none (or got filtered to none)
-  let usedLLM = false, llmTried = false, llmError = null, reasonNoLLM = null;
-  if (recipes.length === 0) {
-    llmTried = true;
-    const llm = await llmRecipe(pantry, prefs);
-    if (llm.reasonNoLLM) reasonNoLLM = llm.reasonNoLLM;
-    if (llm.llmError)    llmError    = llm.llmError;
-    if (llm.recipe){ recipes = [llm.recipe]; usedLLM = true; }
-  }
+  let spoon = await pSpoon; // resolve both; each has internal caps
+  let llm   = await pLLM;
 
-  // NEVER return empty – hand back emergency recipe
-  if (recipes.length === 0){
+  // Choose best available quickly
+  let recipes = [];
+  if (Array.isArray(spoon.results) && spoon.results.length) {
+    recipes = spoon.results;
+  } else if (llm.recipe) {
+    recipes = [llm.recipe];
+  } else {
     recipes = [emergencyRecipe(pantry)];
   }
 
@@ -396,8 +358,15 @@ export default async function handler(req){
     source,
     pantryFrom,
     cleanedPantry: pantry,
-    extra: { spoonacularRawCount: sp.extra?.spoonacularRawCount, kept: sp.extra?.kept, timeCap: sp.extra?.timeCap },
-    usedLLM, llmTried, llmError, reasonNoLLM
+    extra: {
+      spoonacularRawCount: spoon.extra?.spoonacularRawCount,
+      kept: spoon.extra?.kept,
+      timeCap: spoon.extra?.timeCap
+    },
+    usedLLM: !!llm.recipe,
+    llmTried: !!OPENAI_API_KEY,
+    llmError: llm.llmError || null,
+    reasonNoLLM: llm.reasonNoLLM || null
   };
 
   console.log("analyze debug:", debug);
