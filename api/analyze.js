@@ -78,7 +78,21 @@ async function callVision(imageBase64) {
     2500,
     "vision-timeout"
   );
+
+
+if (!r.ok) {throw new Error(`vision http ${r.status}`);}
+
+
+
+
+
   const j = await r.json();
+if (j?.error) {
+   // Vision returned an error payload (bad key, quota, restrictions, etc.)
+   throw new Error(`vision api: ${j.error.message || 'unknown error'}`);}
+
+
+
   const res = j?.responses?.[0] || {};
 
   const rawText = (res.textAnnotations?.[0]?.description || "").toLowerCase();
