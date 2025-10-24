@@ -155,6 +155,15 @@ async function spoonacularRecipes(pantry, prefs){
   url.searchParams.set("instructionsRequired","true");
   url.searchParams.set("addRecipeInformation","true");
   url.searchParams.set("sort","max-used-ingredients");
+
+if (Number(prefs?.explore) > 0) {
+   url.searchParams.set("sort","random");
+   // random offset up to a small range to vary hits but stay fast
+   const offset = Math.min(100, (prefs.explore % 5) * 20);
+   url.searchParams.set("offset", String(offset));
+ }
+
+
   url.searchParams.set("number","24"); // a touch more
   url.searchParams.set("ignorePantry","true");
   url.searchParams.set("type","main course");
@@ -230,7 +239,12 @@ function buildPrompt(pantry, prefs){
   const servings = Math.min(Math.max(prefs?.servings || 2, 1), 6);
   const diet     = prefs?.diet || "none";
   const energy   = prefs?.energyMode || "hob";
-  return `
+
+
+ const exploreNote = Number(prefs?.explore) > 0 ? "Vary style/cuisine a bit compared to earlier suggestions." : "";
+ return `
+
+
 Create ONE savoury DINNER recipe (no drinks, no desserts) using primarily: ${core}.
 Assume staples: salt, pepper, oil, stock cube/paste, onion, garlic, chilli, ginger, smoked paprika,
 curry powder, dried herbs, soy sauce, lemon/lime, vinegar.
