@@ -105,14 +105,28 @@ const WHITELIST = [
   "butternut squash","squash","carrot","pepper","bell pepper","spinach",
   "potato","mushroom","cheese","yogurt","milk","chicken","chicken breast","beef","pork","fish","salmon","tuna",
   "bread","tortilla","wrap","beans","kidney beans","black beans","lentils",
-  "cucumber","lettuce","cabbage","kale","apple","pear","oats","flour","sugar","butter","salt","pepper"
+  "cucumber","lettuce","cabbage","kale","apple","pear","oats","flour","sugar","butter","salt","pepper""almond milk",
+"jeera",
+"cumin",
+"cloves",
+"maggi seasoning",
+"masala",
+"garam masala",
+"scotch bonnet",
+"plantain",
+"callaloo",
+"kidney beans",
+"coconut milk",
+"curry powder"
 ];
+
 const MAP = {
   bananas:"banana", chickpea:"chickpeas", garbanzo:"chickpeas",
   "garbanzo bean":"chickpeas", "garbanzo beans":"chickpeas",
   zucchini:"courgette", courgettes:"courgette", tomato:"tomatoes",
   onions:"onion", eggs:"egg", brockley:"broccoli",
-  "red kidney beans":"kidney beans", "coconutmilk":"coconut milk", "beef seasoning":"seasoning"
+  "red kidney beans":"kidney beans", "coconutmilk":"coconut milk", "beef seasoning":"seasoning", "maggi": "maggi seasoning",
+"jeera": "cumin"
 };
 
 const uniqLower = (arr) => { const s=new Set(); for (const x of arr) s.add(String(x).toLowerCase()); return [...s]; };
