@@ -1,6 +1,7 @@
 // api/analyze.js
 // Fast, resilient pipeline with Vision -> pantry -> Spoonacular + LLM -> fallback.
 // Updated to return up to 3 recipes, dedupe ingredients, and respect prefs.explore.
+// redeploy-noop
 
 export const config = {
   runtime: "nodejs",
