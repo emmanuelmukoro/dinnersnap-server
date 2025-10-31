@@ -37,6 +37,18 @@ function tfetch(url, opts = {}, ms = 2500, label = "fetch-timeout") {
   );
 }
 
+async function withRetry(fn, tries = 2) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); }
+    catch (e) { last = e; }
+  }
+  throw last;
+}
+
+
+
+
 /* ----------------------- Classification Sets ----------------------- */
 const DESSERT = new Set([
   "dessert","pudding","ice cream","smoothie","shake","cookie","brownie",
@@ -155,7 +167,13 @@ const WHITELIST = [
   "tuna","bread","tortilla","wrap","lentils","cucumber","lettuce","cabbage",
   "kale","apple","pear","oats","flour","sugar","butter","salt","pepper",
   "stock cube","curry powder","mixed dried herbs","garam masala",
-  "maggi seasoning","jeera","cumin","cloves",
+  "maggi seasoning","jeera","cumin","cloves","all purpose seasoning", "steak seasoning",
+ "beef seasoning",
+ "paprika",
+ "smoked paprika",
+ "curry paste",
+ "soy sauce",
+ "tropical sun",
 ];
 
 const MAP = {
@@ -258,7 +276,7 @@ async function spoonacularRecipes(pantry, prefs) {
 
   let j = {};
   try {
-    const r = await tfetch(url.toString(), {}, 2000, "spoon-timeout");
+    const r = await withRetry(() => tfetch(url.toString(), {}, 2000, "spoon-timeout"));
     j = await r.json();
   } catch (e) {
     return { results: [], info: { error: String(e?.message || e) } };
@@ -267,88 +285,100 @@ async function spoonacularRecipes(pantry, prefs) {
   const raw = Array.isArray(j?.results) ? j.results : [];
   const specific = pantry.filter((p) => !GENERIC.has(p));
 
-  const filtered = raw.filter((it) => {
+  // strict filter first
+const filtered = raw.filter((it) => {
+  const title = String(it.title || "").toLowerCase();
+  const dish = (it.dishTypes || []).map((d) => String(d).toLowerCase());
+
+  if (titleHasAny(title, DESSERT)) return false;
+  if (titleHasAny(title, DRINK)) return false;
+  if (titleHasAny(title, ALCOHOL)) return false;
+  if (dish.some((d) => ["drink", "beverage", "cocktail", "dessert"].includes(d))) return false;
+
+  const used = it.usedIngredientCount ?? 0;
+  const time = it.readyInMinutes ?? 999;
+
+  if (used < 2) return false;
+  if (time > timeCap) return false;
+
+  // only enforce “specific term” rule when we actually have >= 2 specific pantry items
+  if (specific.length >= 2 && !hasSpecificTermInTitleOrIngredients(it, specific)) return false;
+
+  // fish sanity check
+  if (
+    /shrimp|prawn|salmon|tuna|anchovy|sardine/.test(title) &&
+    !pantry.some((p) => ["shrimp", "prawn", "salmon", "tuna", "fish"].includes(p))
+  ) return false;
+
+  return true;
+});
+
+// if nothing survived strict filter, try a relaxed one
+let survivors = filtered;
+if (survivors.length === 0) {
+  const relaxed = raw.filter((it) => {
     const title = String(it.title || "").toLowerCase();
     const dish = (it.dishTypes || []).map((d) => String(d).toLowerCase());
 
-    if (titleHasAny(title, DESSERT)) return false;
-    if (titleHasAny(title, DRINK)) return false;
-    if (titleHasAny(title, ALCOHOL)) return false;
-    if (dish.some((d) => ["drink", "beverage", "cocktail", "dessert"].includes(d))) {
-      return false;
-    }
+    if (titleHasAny(title, DESSERT) || titleHasAny(title, DRINK) || titleHasAny(title, ALCOHOL)) return false;
+    if (dish.some((d) => ["drink","beverage","cocktail","dessert"].includes(d))) return false;
 
     const used = it.usedIngredientCount ?? 0;
-    const missed = it.missedIngredientCount ?? 0;
     const time = it.readyInMinutes ?? 999;
-    if (used < 2) return false;
+
+    // relax used>=1, keep time cap
+    if (used < 1) return false;
     if (time > timeCap) return false;
-
-    if (
-      specific.length > 0 &&
-      !hasSpecificTermInTitleOrIngredients(it, specific)
-    ) {
-      return false;
-    }
-
-    if (
-      /shrimp|prawn|salmon|tuna|anchovy|sardine/.test(title) &&
-      !pantry.some((p) =>
-        ["shrimp", "prawn", "salmon", "tuna", "fish"].includes(p)
-      )
-    ) {
-      return false;
-    }
 
     return true;
   });
+  survivors = relaxed;
+}
 
-  const scored = filtered.map((it) => {
-    const used = it.usedIngredientCount ?? 0;
-    const missed = it.missedIngredientCount ?? 0;
-    const time = it.readyInMinutes ?? 30;
-    const score =
-      0.7 * (used / (used + missed + 1)) +
-      0.3 * (1 - Math.min(time, 60) / 60);
-
-    return {
-      id: String(it.id),
-      title: it.title,
-      time,
-      energy: "hob",
-      cost: 2.5,
-      score: Math.round(score * 100) / 100,
-      ingredients: (it.extendedIngredients || []).map((ing) => {
-        const nm = String(ing.name || "").toLowerCase();
-        return { name: nm, have: pantry.includes(nm) };
-      }),
-      steps: (
-        it.analyzedInstructions?.[0]?.steps || []
-      ).map((s, i) => ({
-        id: `${it.id}-s${i}`,
-        text: s.step,
-      })),
-      badges: ["web"],
-    };
-  });
-
-  const arr = [...scored];
-  if (prefs.explore) {
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j2 = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j2]] = [arr[j2], arr[i]];
-    }
-  }
+// score + shape
+const scored = survivors.map((it) => {
+  const used = it.usedIngredientCount ?? 0;
+  const missed = it.missedIngredientCount ?? 0;
+  const time = it.readyInMinutes ?? 30;
+  const score = 0.7 * (used / (used + missed + 1)) + 0.3 * (1 - Math.min(time, 60) / 60);
 
   return {
-    results: arr,
-    info: {
-      spoonacularRawCount: raw.length,
-      kept: arr.length,
-      timeCap,
-    },
+    id: String(it.id),
+    title: it.title,
+    time,
+    energy: "hob",
+    cost: 2.5,
+    score: Math.round(score * 100) / 100,
+    ingredients: (it.extendedIngredients || []).map((ing) => {
+      const nm = String(ing.name || "").toLowerCase();
+      return { name: nm, have: pantry.includes(nm) };
+    }),
+    steps: (it.analyzedInstructions?.[0]?.steps || []).map((s, i) => ({
+      id: `${it.id}-s${i}`,
+      text: s.step,
+    })),
+    badges: ["web"],
   };
+});
+
+// shuffle a touch if explore
+const arr = [...scored];
+if (prefs.explore) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j2 = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j2]] = [arr[j2], arr[i]];
+  }
 }
+
+return {
+  results: arr,
+  info: {
+    spoonacularRawCount: raw.length,
+    kept: arr.length,
+    timeCap,
+  },
+};
+
 
 /* ----------------------- LLM (2.5s cap) ----------------------- */
 function buildPrompt(pantry, prefs) {
@@ -400,19 +430,8 @@ async function llmRecipe(pantry, prefs) {
   };
 
   try {
-    const r = await tfetch(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${OPENAI_API_KEY}`,
-        },
-        body: JSON.stringify(body),
-      },
-      2500,
-      "llm-timeout"
-    );
+    const r = await withRetry( () => tfetch("https://api.openai.com/v1/chat/completions", { ... }, 4000, "llm-timeout")
+ );
 
     const j = await r.json();
     const txt = j?.choices?.[0]?.message?.content || "";
@@ -444,14 +463,14 @@ async function llmRecipe(pantry, prefs) {
 }
 
 /* ----------------------- Emergency Recipe ----------------------- */
-function emergencyRecipe(pantry) {
+function emergencyRecipe(pantry, explore = 0) {
   const titleBits = [];
   if (pantry.some((p) => p.includes("chickpea"))) titleBits.push("Chickpea");
   if (pantry.includes("coconut cream")) titleBits.push("Coconut");
   if (pantry.some((p) => PASTA.has(p))) titleBits.push("Spaghetti");
 
   const title =
-    (titleBits.length ? titleBits.join(" ") : "Pantry") + " Savoury Skillet";
+    (titleBits.length ? titleBits.join(" ") : "Pantry") + ` Savoury Skillet (idea ${((explore % 5) + 1)})`;
 
   const baseIngs = [
     { name: "onion (or onion powder)", have: pantry.includes("onion") },
@@ -478,7 +497,7 @@ function emergencyRecipe(pantry) {
   const uniqPantry = pantry.map((p) => ({ name: p, have: true }));
 
   return {
-    id: `local-${Date.now()}`,
+    id: `local-${Date.now()}-${explore}`,
     title,
     time: 15,
     cost: 2.0,
@@ -641,7 +660,7 @@ export default async function handler(req, res) {
       }
     }
     if (combined.length === 0) {
-      combined = [emergencyRecipe(pantry)];
+      combined = [emergencyRecipe(pantry, prefs?.explore || 0)];
     } else if (combined.length > 3) {
       combined = combined.slice(0, 3);
     }
