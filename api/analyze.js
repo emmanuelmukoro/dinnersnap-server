@@ -328,4 +328,80 @@ export default async function handler(req) {
         pantry = [];
       }
     } else {
-      return json(400, { error: "imageBase64 required (or pantryOverride
+      return json(400, { error: "imageBase64 required (or pantryOverride)" });
+    }
+
+    // Pantry-only fast return
+    if (prefs?.pantryOnly) {
+      const debug = {
+        source,
+        pantryFrom,
+        cleanedPantry: pantry,
+        usedLLM: false,
+        totalMs: nowMs() - tStart,
+        mode: "pantryOnly",
+      };
+      console.log("analyze pantryOnly debug:", debug);
+      return json(200, { pantry, recipes: [], debug });
+    }
+
+    // Full providers
+    const spoonP = (async () => {
+      const s0 = nowMs();
+      const sp = await spoonacularRecipes(pantry, prefs);
+      console.log(`spoon end in ${nowMs() - s0}ms kept=${sp.info?.kept}`);
+      return sp.results || [];
+    })();
+    const llmP = (async () => {
+      const l0 = nowMs();
+      const llm = await llmRecipe(pantry, prefs);
+      console.log(`llm end in ${nowMs() - l0}ms ok=${!!llm.recipe}`);
+      return llm.recipe ? [llm.recipe] : [];
+    })();
+
+    let spoonList = [],
+      llmList = [];
+    try {
+      [spoonList, llmList] = await Promise.all([
+        spoonP.catch(() => []),
+        llmP.catch(() => []),
+      ]);
+    } catch {}
+
+    let combined = [];
+    if (spoonList.length) combined = spoonList;
+    if (combined.length < 3 && llmList.length) {
+      for (const rec of llmList) {
+        if (!combined.find((r) => r.id === rec.id)) {
+          combined.push(rec);
+          if (combined.length >= 3) break;
+        }
+      }
+    }
+    if (!combined.length) combined = [emergencyRecipe(pantry)];
+    else if (combined.length > 3) combined = combined.slice(0, 3);
+
+    const debug = {
+      source,
+      pantryFrom,
+      cleanedPantry: pantry,
+      usedLLM: combined.some((r) => Array.isArray(r.badges) && r.badges.includes("llm")),
+      totalMs: nowMs() - tStart,
+    };
+    console.log("analyze debug:", debug);
+    return json(200, { pantry, recipes: combined, debug });
+  };
+
+  try {
+    const out = await withTimeout(() => main(), watchdogMs, "watchdog");
+    console.log(`handler total=${nowMs() - t0}ms`);
+    return out;
+  } catch (e) {
+    console.log("watchdog fired:", String(e?.message || e));
+    return json(200, {
+      pantry: [],
+      recipes: [emergencyRecipe([])],
+      debug: { source: "watchdog", error: String(e?.message || e) },
+    });
+  }
+}
