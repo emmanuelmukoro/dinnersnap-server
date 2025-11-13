@@ -37,9 +37,18 @@ function tfetch(url, opts = {}, ms = 2500, label = "fetch-timeout") {
 }
 
 /* ----------------------- Classifiers ----------------------- */
-const DESSERT = new Set(["dessert","pudding","ice cream","smoothie","shake","cookie","brownie","cupcake","cake","muffin","pancake","waffle","jam","jelly","compote","truffle","fudge","sorbet","parfait","custard","tart","shortbread","licorice","cobbler"]);
-const DRINK   = new Set(["drink","beverage","mocktail","cocktail","margarita","mojito","spritzer","soda","punch","toddy"]);
-const ALCOHOL = new Set(["brandy","rum","vodka","gin","whisky","whiskey","bourbon","tequila","wine","liqueur","amaretto","cognac","port","sherry"]);
+const DESSERT = new Set([
+  "dessert","pudding","ice cream","smoothie","shake","cookie","brownie","cupcake","cake",
+  "muffin","pancake","waffle","jam","jelly","compote","truffle","fudge","sorbet","parfait",
+  "custard","tart","shortbread","licorice","cobbler"
+]);
+const DRINK   = new Set([
+  "drink","beverage","mocktail","cocktail","margarita","mojito","spritzer","soda","punch","toddy"
+]);
+const ALCOHOL = new Set([
+  "brandy","rum","vodka","gin","whisky","whiskey","bourbon","tequila","wine","liqueur",
+  "amaretto","cognac","port","sherry"
+]);
 const GENERIC = new Set(["pasta","rice","bread","flour","sugar","oil","salt","pepper"]);
 const MEAT    = new Set(["chicken","beef","pork","lamb","bacon","ham","turkey","shrimp","prawn","salmon","tuna","fish"]);
 const PASTA   = new Set(["pasta","spaghetti","macaroni","penne","farfalle","orzo","fusilli","linguine","tagliatelle"]);
@@ -49,6 +58,7 @@ const titleHasAny = (title, set) => {
   for (const w of set) if (t.includes(w)) return true;
   return false;
 };
+
 const hasSpecificTermInTitleOrIngredients = (item, specificTerms) => {
   const t = String(item.title || "").toLowerCase();
   const ings = (item.extendedIngredients || []).map((i) => String(i.name || "").toLowerCase());
@@ -88,10 +98,16 @@ async function callVision(imageBase64) {
   const res = j?.responses?.[0] || {};
 
   const rawText = (res.textAnnotations?.[0]?.description || "").toLowerCase();
-  const RAW_TOKENS = rawText.split(/[^a-z]+/g).map((t) => t.trim()).filter(Boolean);
+  const RAW_TOKENS = rawText
+    .split(/[^a-z]+/g)
+    .map((t) => t.trim())
+    .filter(Boolean);
 
   const FOODISH = new Set([
-    "ingredients","organic","sauce","soup","canned","tin","dried","fresh","frozen","beans","peas","lentils","broccoli","banana","tomato","onion","garlic","squash","chickpea","chickpeas","feta","rice","pasta","spaghetti","oats","milk","yogurt","cheese","lemon","orange","pepper","spinach","mushroom","potato","avocado","coconut","cream",
+    "ingredients","organic","sauce","soup","canned","tin","dried","fresh","frozen","beans","peas","lentils",
+    "broccoli","banana","tomato","onion","garlic","squash","chickpea","chickpeas","feta","rice","pasta",
+    "spaghetti","oats","milk","yogurt","cheese","lemon","orange","pepper","spinach","mushroom","potato",
+    "avocado","coconut","cream",
   ]);
 
   const ocrTokens = RAW_TOKENS.filter((t) => t.length >= 4 && FOODISH.has(t));
@@ -102,8 +118,15 @@ async function callVision(imageBase64) {
 
 /* ----------------------- Pantry cleanup ----------------------- */
 const WHITELIST = [
-  "banana","broccoli","chickpeas","beans","kidney beans","tomatoes","onion","garlic","ginger","olive oil","pasta","spaghetti","courgette","feta","orzo","rice","egg","spring onion","lemon","orange","avocado","coconut milk","coconut cream","butternut squash","squash","carrot","pepper","bell pepper","spinach","potato","mushroom","cheese","cheddar","yogurt","milk","almond milk","chicken","chicken breast","beef","pork","fish","salmon","tuna","bread","tortilla","wrap","lentils","cucumber","lettuce","cabbage","kale","apple","pear","oats","flour","sugar","butter","salt","pepper","stock cube","curry powder","mixed dried herbs","garam masala","maggi seasoning","jeera","cumin","cloves",
+  "banana","broccoli","chickpeas","beans","kidney beans","tomatoes","onion","garlic","ginger","olive oil",
+  "pasta","spaghetti","courgette","feta","orzo","rice","egg","spring onion","lemon","orange","avocado",
+  "coconut milk","coconut cream","butternut squash","squash","carrot","pepper","bell pepper","spinach",
+  "potato","mushroom","cheese","cheddar","yogurt","milk","almond milk","chicken","chicken breast","beef",
+  "pork","fish","salmon","tuna","bread","tortilla","wrap","lentils","cucumber","lettuce","cabbage","kale",
+  "apple","pear","oats","flour","sugar","butter","salt","pepper","stock cube","curry powder","mixed dried herbs",
+  "garam masala","maggi seasoning","jeera","cumin","cloves",
 ];
+
 const MAP = {
   bananas: "banana",
   chickpea: "chickpeas",
@@ -121,9 +144,54 @@ const MAP = {
 };
 
 const uniqLower = (arr) => [...new Set(arr.map((x) => String(x).toLowerCase()))];
-function lev(a,b){const m=[];for(let i=0;i<=b.length;i++)m[i]=[i];for(let j=0;j<=a.length;j++)m[0][j]=j;for(let i=1;i<=b.length;i++){for(let j=1;j<=a.length;j++){m[i][j]=Math.min(m[i-1][j]+1,m[i][j-1]+1,m[i-1][j-1]+(b[i-1]===a[j-1]?0:1));}}return m[b.length][a.length];}
-function nearestWhitelistStrict(term){let best=null,bestDist=2;for(const w of WHITELIST){const d=lev(term,w);if(d<bestDist){bestDist=d;best=w;}}return bestDist<=1?best:null;}
-function cleanPantry(raw){const out=new Set();for(const t0 of uniqLower(raw)){const t=MAP[t0]||t0;if(WHITELIST.includes(t)){out.add(t);continue;}if(t.length>=5){const near=nearestWhitelistStrict(t);if(near){out.add(near);continue;}}}return [...out];}
+
+function lev(a, b) {
+  const m = [];
+  for (let i = 0; i <= b.length; i++) m[i] = [i];
+  for (let j = 0; j <= a.length; j++) m[0][j] = j;
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      m[i][j] = Math.min(
+        m[i - 1][j] + 1,
+        m[i][j - 1] + 1,
+        m[i - 1][j - 1] + (b[i - 1] === a[j - 1] ? 0 : 1)
+      );
+    }
+  }
+  return m[b.length][a.length];
+}
+
+function nearestWhitelistStrict(term) {
+  let best = null;
+  let bestDist = 2;
+  for (const w of WHITELIST) {
+    const d = lev(term, w);
+    if (d < bestDist) {
+      bestDist = d;
+      best = w;
+    }
+  }
+  return bestDist <= 1 ? best : null;
+}
+
+function cleanPantry(raw) {
+  const out = new Set();
+  for (const t0 of uniqLower(raw)) {
+    const t = MAP[t0] || t0;
+    if (WHITELIST.includes(t)) {
+      out.add(t);
+      continue;
+    }
+    if (t.length >= 5) {
+      const near = nearestWhitelistStrict(t);
+      if (near) {
+        out.add(near);
+        continue;
+      }
+    }
+  }
+  return [...out];
+}
 
 /* ----------------------- Spoonacular ----------------------- */
 async function spoonacularRecipes(pantry, prefs) {
@@ -160,17 +228,22 @@ async function spoonacularRecipes(pantry, prefs) {
   const filtered = raw.filter((it) => {
     const title = String(it.title || "").toLowerCase();
     const dish = (it.dishTypes || []).map((d) => String(d).toLowerCase());
+
     if (titleHasAny(title, DESSERT)) return false;
     if (titleHasAny(title, DRINK)) return false;
     if (titleHasAny(title, ALCOHOL)) return false;
     if (dish.some((d) => ["drink","beverage","cocktail","dessert"].includes(d))) return false;
+
     const used = it.usedIngredientCount ?? 0;
     const time = it.readyInMinutes ?? 999;
     if (used < 2) return false;
     if (time > timeCap) return false;
+
     if (specific.length >= 2 && !hasSpecificTermInTitleOrIngredients(it, specific)) return false;
+
     if (/shrimp|prawn|salmon|tuna|anchovy|sardine/.test(title) &&
         !pantry.some((p) => ["shrimp","prawn","salmon","tuna","fish"].includes(p))) return false;
+
     return true;
   });
 
@@ -181,6 +254,7 @@ async function spoonacularRecipes(pantry, prefs) {
     const score =
       0.7 * (used / (used + missed + 1)) +
       0.3 * (1 - Math.min(time, 60) / 60);
+
     return {
       id: String(it.id),
       title: it.title,
@@ -199,6 +273,7 @@ async function spoonacularRecipes(pantry, prefs) {
       badges: ["web"],
     };
   });
+
   return { results: scored, info: { spoonacularRawCount: raw.length, kept: scored.length, timeCap } };
 }
 
@@ -295,10 +370,29 @@ export default async function handler(req) {
   const t0 = nowMs();
   if (req.method !== "POST") return json(405, { error: "POST only" });
 
+  // --- Timed & safe body parse (Response 2 optimisation) ---
+  let bodyRaw = "";
+  try {
+    bodyRaw = await withTimeout(
+      () => req.text(),
+      3000,
+      "body-timeout"
+    );
+  } catch (e) {
+    console.log("body parse timeout:", String(e?.message || e));
+    return json(408, { error: "body-timeout" });
+  }
+
+  // Quick size guard (~3.5M base64 chars ≈ ~2.6MB binary)
+  if (bodyRaw && bodyRaw.length > 3_500_000) {
+    console.log("body too large:", bodyRaw.length);
+    return json(413, { error: "payload-too-large" });
+  }
+
   let body;
   try {
-    body = await req.json();
-  } catch {
+    body = JSON.parse(bodyRaw || "{}");
+  } catch (e) {
     return json(400, { error: "invalid JSON" });
   }
 
@@ -317,11 +411,19 @@ export default async function handler(req) {
     } else if (imageBase64) {
       try {
         const v0 = nowMs();
-        const visRes = await withTimeout(() => callVision(imageBase64), 2500, "vision-timeout");
+        const visRes = await withTimeout(
+          () => callVision(imageBase64),
+          2500,
+          "vision-timeout"
+        );
         pantryFrom = { ocr: visRes.ocrTokens, labels: visRes.labels, objects: visRes.objects };
-        pantry = cleanPantry([...(visRes.ocrTokens||[]),...(visRes.labels||[]),...(visRes.objects||[])]);
+        pantry = cleanPantry([
+          ...(visRes.ocrTokens || []),
+          ...(visRes.labels || []),
+          ...(visRes.objects || []),
+        ]);
         source = "vision";
-        console.log(`vision ok in ${nowMs() - v0}ms pantry=`, pantry);
+        console.log("vision ok in", nowMs() - v0, "ms pantry=", pantry);
       } catch (e) {
         source = "vision-failed";
         pantryFrom = { error: String(e?.message || e) };
@@ -349,24 +451,26 @@ export default async function handler(req) {
     const spoonP = (async () => {
       const s0 = nowMs();
       const sp = await spoonacularRecipes(pantry, prefs);
-      console.log(`spoon end in ${nowMs() - s0}ms kept=${sp.info?.kept}`);
+      console.log("spoon end in", nowMs() - s0, "ms kept=", sp.info?.kept);
       return sp.results || [];
     })();
     const llmP = (async () => {
       const l0 = nowMs();
       const llm = await llmRecipe(pantry, prefs);
-      console.log(`llm end in ${nowMs() - l0}ms ok=${!!llm.recipe}`);
+      console.log("llm end in", nowMs() - l0, "ms ok=", !!llm.recipe);
       return llm.recipe ? [llm.recipe] : [];
     })();
 
-    let spoonList = [],
-      llmList = [];
+    let spoonList = [];
+    let llmList = [];
     try {
       [spoonList, llmList] = await Promise.all([
         spoonP.catch(() => []),
         llmP.catch(() => []),
       ]);
-    } catch {}
+    } catch {
+      // ignore
+    }
 
     let combined = [];
     if (spoonList.length) combined = spoonList;
@@ -385,7 +489,9 @@ export default async function handler(req) {
       source,
       pantryFrom,
       cleanedPantry: pantry,
-      usedLLM: combined.some((r) => Array.isArray(r.badges) && r.badges.includes("llm")),
+      usedLLM: combined.some(
+        (r) => Array.isArray(r.badges) && r.badges.includes("llm")
+      ),
       totalMs: nowMs() - tStart,
     };
     console.log("analyze debug:", debug);
@@ -394,7 +500,7 @@ export default async function handler(req) {
 
   try {
     const out = await withTimeout(() => main(), watchdogMs, "watchdog");
-    console.log(`handler total=${nowMs() - t0}ms`);
+    console.log("handler total=", nowMs() - t0, "ms");
     return out;
   } catch (e) {
     console.log("watchdog fired:", String(e?.message || e));
