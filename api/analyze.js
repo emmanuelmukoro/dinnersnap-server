@@ -1,5 +1,5 @@
 // api/analyze.js
-// ESM-only. Works with "type":"module" in package.json".
+// Node.js Vercel Function (ESM).
 // Vision -> cleaned pantry -> Spoonacular + LLM (in parallel) -> emergency fallback.
 
 export const config = {
@@ -15,11 +15,11 @@ const SPOON_KEY = process.env.SPOON_KEY || process.env.SPOONACULAR_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 /* ----------------------- Helpers ----------------------- */
-const json = (status, obj) =>
-  new Response(JSON.stringify(obj), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
+const sendJson = (res, status, obj) => {
+  res.statusCode = status;
+  res.setHeader("content-type", "application/json");
+  res.end(JSON.stringify(obj));
+};
 
 const nowMs = () => Number(process.hrtime.bigint() / 1000000n);
 
@@ -34,6 +34,29 @@ function withTimeout(run, ms, label = "timeout") {
 
 function tfetch(url, opts = {}, ms = 2500, label = "fetch-timeout") {
   return withTimeout((signal) => fetch(url, { ...opts, signal }), ms, label);
+}
+
+// Read raw body from Node req and JSON.parse it, with a simple size guard.
+function readJsonBody(req, maxChars = 3_500_000) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > maxChars) {
+        reject(new Error("payload-too-large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (!body) return resolve({});
+      try {
+        resolve(JSON.parse(body));
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on("error", reject);
+  });
 }
 
 /* ----------------------- Classifiers ----------------------- */
@@ -346,8 +369,14 @@ function emergencyRecipe(pantry) {
     { name: "ginger (or ground ginger)", have: pantry.includes("ginger") },
     { name: "mixed dried herbs", have: pantry.includes("mixed dried herbs") },
     { name: "stock cube", have: pantry.includes("stock cube") },
-    { name: "lemon or vinegar", have: pantry.includes("lemon") || pantry.includes("vinegar") },
-    { name: "salt & black pepper", have: pantry.includes("salt") || pantry.includes("black pepper") },
+    {
+      name: "lemon or vinegar",
+      have: pantry.includes("lemon") || pantry.includes("vinegar"),
+    },
+    {
+      name: "salt & black pepper",
+      have: pantry.includes("salt") || pantry.includes("black pepper"),
+    },
   ];
   const uniqPantry = pantry.map((p) => ({ name: p, have: true }));
   return {
@@ -366,17 +395,22 @@ function emergencyRecipe(pantry) {
 }
 
 /* ----------------------- Handler ----------------------- */
-export default async function handler(req) {
+export default async function handler(req, res) {
   const t0 = nowMs();
-  if (req.method !== "POST") return json(405, { error: "POST only" });
+  if (req.method !== "POST") {
+    return sendJson(res, 405, { error: "POST only" });
+  }
 
-  // Back to req.json() — Vercel supports this, not req.text()
   let body;
   try {
-    body = await req.json();
+    body = await readJsonBody(req);
   } catch (e) {
+    if (String(e.message) === "payload-too-large") {
+      console.log("body too large");
+      return sendJson(res, 413, { error: "payload-too-large" });
+    }
     console.log("body parse error:", String(e?.message || e));
-    return json(400, { error: "invalid JSON body" });
+    return sendJson(res, 400, { error: "invalid JSON body" });
   }
 
   const { imageBase64, pantryOverride, prefs = {} } = body || {};
@@ -399,7 +433,11 @@ export default async function handler(req) {
           2500,
           "vision-timeout"
         );
-        pantryFrom = { ocr: visRes.ocrTokens, labels: visRes.labels, objects: visRes.objects };
+        pantryFrom = {
+          ocr: visRes.ocrTokens,
+          labels: visRes.labels,
+          objects: visRes.objects,
+        };
         pantry = cleanPantry([
           ...(visRes.ocrTokens || []),
           ...(visRes.labels || []),
@@ -413,7 +451,9 @@ export default async function handler(req) {
         pantry = [];
       }
     } else {
-      return json(400, { error: "imageBase64 required (or pantryOverride)" });
+      return sendJson(res, 400, {
+        error: "imageBase64 required (or pantryOverride)",
+      });
     }
 
     // Pantry-only fast return
@@ -427,7 +467,7 @@ export default async function handler(req) {
         mode: "pantryOnly",
       };
       console.log("analyze pantryOnly debug:", debug);
-      return json(200, { pantry, recipes: [], debug });
+      return sendJson(res, 200, { pantry, recipes: [], debug });
     }
 
     // Full providers
@@ -478,16 +518,15 @@ export default async function handler(req) {
       totalMs: nowMs() - tStart,
     };
     console.log("analyze debug:", debug);
-    return json(200, { pantry, recipes: combined, debug });
+    return sendJson(res, 200, { pantry, recipes: combined, debug });
   };
 
   try {
-    const out = await withTimeout(() => main(), watchdogMs, "watchdog");
+    await withTimeout(() => main(), watchdogMs, "watchdog");
     console.log("handler total=", nowMs() - t0, "ms");
-    return out;
   } catch (e) {
     console.log("watchdog fired:", String(e?.message || e));
-    return json(200, {
+    return sendJson(res, 200, {
       pantry: [],
       recipes: [emergencyRecipe([])],
       debug: { source: "watchdog", error: String(e?.message || e) },
