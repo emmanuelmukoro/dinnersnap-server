@@ -370,30 +370,13 @@ export default async function handler(req) {
   const t0 = nowMs();
   if (req.method !== "POST") return json(405, { error: "POST only" });
 
-  // --- Timed & safe body parse (Response 2 optimisation) ---
-  let bodyRaw = "";
-  try {
-    bodyRaw = await withTimeout(
-      () => req.text(),
-      3000,
-      "body-timeout"
-    );
-  } catch (e) {
-    console.log("body parse timeout:", String(e?.message || e));
-    return json(408, { error: "body-timeout" });
-  }
-
-  // Quick size guard (~3.5M base64 chars ≈ ~2.6MB binary)
-  if (bodyRaw && bodyRaw.length > 3_500_000) {
-    console.log("body too large:", bodyRaw.length);
-    return json(413, { error: "payload-too-large" });
-  }
-
+  // Back to req.json() — Vercel supports this, not req.text()
   let body;
   try {
-    body = JSON.parse(bodyRaw || "{}");
+    body = await req.json();
   } catch (e) {
-    return json(400, { error: "invalid JSON" });
+    console.log("body parse error:", String(e?.message || e));
+    return json(400, { error: "invalid JSON body" });
   }
 
   const { imageBase64, pantryOverride, prefs = {} } = body || {};
