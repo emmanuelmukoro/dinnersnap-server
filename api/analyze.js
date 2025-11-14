@@ -59,6 +59,27 @@ function readJsonBody(req, maxChars = 3_500_000) {
   });
 }
 
+function stripMeatWhenSeasoning(tokens) {
+  const lower = tokens.map((t) => String(t).toLowerCase());
+  const hasSeasoningWord = lower.some((t) =>
+    /seasoning|stock|bouillon|gravy/.test(t)
+  );
+  if (!hasSeasoningWord) return tokens;
+
+  const meatWords = new Set([
+    "beef",
+    "chicken",
+    "lamb",
+    "pork",
+    "ham",
+    "turkey",
+    "steak",
+  ]);
+
+  return lower.filter((t) => !meatWords.has(t));
+}
+
+
 /* ----------------------- Classifiers & constants ----------------------- */
 const DESSERT = new Set([
   "dessert","pudding","ice cream","smoothie","shake","cookie","brownie","cupcake","cake",
@@ -239,16 +260,22 @@ function cleanPantry(raw) {
 
 // Combine common multi-word ingredients from OCR tokens
 function addPhraseCombos(tokens) {
-  const set = new Set(tokens.map((t) => String(t).toLowerCase()));
-  const out = new Set(set);
+  const base = tokens
+    .map((t) => String(t).toLowerCase())
+    .filter(Boolean);
+  const set = new Set(base);
+  const out = new Set(base);
 
-  // coconut + milk => coconut milk
+  // coconut + milk => coconut milk, drop plain milk
   if (set.has("coconut") && set.has("milk")) {
     out.add("coconut milk");
+    out.delete("milk");
   }
-  // kidney + beans => kidney beans
+
+  // kidney + beans => kidney beans, drop generic beans
   if (set.has("kidney") && set.has("beans")) {
     out.add("kidney beans");
+    out.delete("beans");
   }
 
   return [...out];
@@ -455,7 +482,17 @@ async function llmRecipes(pantry, prefs, needed = 3) {
     );
     const j = await r.json();
     const raw = j?.choices?.[0]?.message?.content;
-    if (!raw) return { recipes: [], info: { error: "no content" } };
+
+if (j?.error) {
+  console.log("LLM API error:", j.error);
+  return { recipes: [], info: { error: j.error.message || "openai-error" } };
+}
+if (!raw) {
+  console.log("LLM empty content:", j);
+  return { recipes: [], info: { error: "no content" } };
+}
+
+
 
     let root;
     try {
@@ -518,38 +555,75 @@ async function llmRecipes(pantry, prefs, needed = 3) {
 
 /* ----------------------- Emergency ----------------------- */
 function emergencyRecipe(pantry) {
+  const pantrySet = new Set(pantry);
+
   const titleBits = [];
   if (pantry.some((p) => p.includes("chickpea"))) titleBits.push("Chickpea");
-  if (pantry.includes("coconut cream") || pantry.includes("coconut milk")) titleBits.push("Coconut");
+  if (pantry.includes("coconut cream") || pantry.includes("coconut milk"))
+    titleBits.push("Coconut");
   if (pantry.some((p) => PASTA.has(p))) titleBits.push("Spaghetti");
   const title =
     (titleBits.length ? titleBits.join(" ") : "Pantry") + " Savoury Skillet";
+
   const baseIngs = [
-    { name: "onion (or onion powder)", have: pantry.includes("onion") },
-    { name: "garlic (or garlic powder)", have: pantry.includes("garlic") },
-    { name: "ginger (or ground ginger)", have: pantry.includes("ginger") },
-    { name: "mixed dried herbs", have: pantry.includes("mixed dried herbs") },
-    { name: "stock cube", have: pantry.includes("stock cube") },
+    { name: "onion (or onion powder)", have: pantrySet.has("onion") },
+    { name: "garlic (or garlic powder)", have: pantrySet.has("garlic") },
+    { name: "ginger (or ground ginger)", have: pantrySet.has("ginger") },
+    {
+      name: "mixed dried herbs",
+      have: pantrySet.has("mixed dried herbs"),
+    },
+    { name: "stock cube", have: pantrySet.has("stock cube") },
     {
       name: "lemon or vinegar",
-      have: pantry.includes("lemon") || pantry.includes("vinegar"),
+      have: pantrySet.has("lemon") || pantrySet.has("vinegar"),
     },
     {
       name: "salt & black pepper",
-      have: pantry.includes("salt") || pantry.includes("black pepper"),
+      have:
+        pantrySet.has("salt") ||
+        pantrySet.has("black pepper") ||
+        pantrySet.has("pepper"),
     },
   ];
+
+  // pantry items as {name,have:true}
   const uniqPantry = pantry.map((p) => ({ name: p, have: true }));
+
+  // dedupe by name so we don’t get “salt” twice etc.
+  const combined = [...uniqPantry, ...baseIngs];
+  const seen = new Set();
+  const ingredients = [];
+  for (const ing of combined) {
+    const nm = ing.name.toLowerCase();
+    if (seen.has(nm)) continue;
+    seen.add(nm);
+    ingredients.push(ing);
+  }
+
+  // show a few example pantry items in step text
+  const sample = pantry.slice(0, 4).join(", ") || "your pantry items";
+
   return {
-    id: `local-${Date.now()}`,
+    id:
+      "local-" +
+      Date.now() +
+      "-" +
+      Math.random().toString(36).slice(2, 8),
     title,
     time: 15,
     cost: 2.0,
     energy: "hob",
-    ingredients: [...uniqPantry, ...baseIngs],
+    ingredients,
     steps: [
-      { id: "s1", text: "Heat oil; add onion, garlic & ginger. Cook 2–3 min." },
-      { id: "s2", text: "Add pantry items and simmer 6–8 min." },
+      {
+        id: "s1",
+        text: "Heat oil; add onion, garlic & ginger. Cook 2–3 min.",
+      },
+      {
+        id: "s2",
+        text: `Add your selected pantry ingredients (e.g. ${sample}) and simmer 6–8 min.`,
+      },
     ],
     badges: ["local"],
     shoppingList: [],
@@ -601,12 +675,16 @@ export default async function handler(req, res) {
           objects: visRes.objects,
         };
         const rawTokens = [
-          ...(visRes.ocrTokens || []),
-          ...(visRes.labels || []),
-          ...(visRes.objects || []),
-        ];
-        const withCombos = addPhraseCombos(rawTokens);
-        pantry = cleanPantry(withCombos);
+  ...(visRes.ocrTokens || []),
+  ...(visRes.labels || []),
+  ...(visRes.objects || []),
+];
+
+const seasoningSafe = stripMeatWhenSeasoning(rawTokens);
+const withCombos = addPhraseCombos(seasoningSafe);
+pantry = cleanPantry(withCombos);
+
+
         source = "vision";
         console.log("vision ok in", nowMs() - v0, "ms pantry=", pantry);
       } catch (e) {
