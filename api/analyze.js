@@ -172,7 +172,7 @@ async function callVision(imageBase64) {
     "ingredients","organic","sauce","soup","canned","tin","dried","fresh","frozen","beans","peas","lentils",
     "broccoli","banana","tomato","onion","garlic","squash","chickpea","chickpeas","feta","rice","pasta",
     "spaghetti","oats","milk","yogurt","cheese","lemon","orange","pepper","spinach","mushroom","potato",
-    "avocado","coconut","cream",
+    "avocado","coconut","cream", "seasoning", "red kidney",
   ]);
 
   const ocrTokens = RAW_TOKENS.filter((t) => t.length >= 4 && FOODISH.has(t));
@@ -317,152 +317,154 @@ async function spoonacularRecipes(pantry, prefs) {
   const staplesSet = new Set(ALLOWED_EXTRAS);
 
   const filtered = raw.filter((it) => {
-    const title = String(it.title || "").toLowerCase();
-    const dish = (it.dishTypes || []).map((d) => String(d).toLowerCase());
-    const ingNames = (it.extendedIngredients || []).map((ing) =>
-      String(ing.name || "").toLowerCase()
-    );
+  const title = String(it.title || "").toLowerCase();
+  const dish = (it.dishTypes || []).map((d) => String(d).toLowerCase());
+  const ingNames = (it.extendedIngredients || []).map((ing) =>
+    String(ing.name || "").toLowerCase()
+  );
 
-    // basic filters
-    if (titleHasAny(title, DESSERT)) return false;
-    if (titleHasAny(title, DRINK)) return false;
-    if (titleHasAny(title, ALCOHOL)) return false;
-    if (dish.some((d) => ["drink", "beverage", "cocktail", "dessert"].includes(d))) return false;
+  // basic filters
+  if (titleHasAny(title, DESSERT)) return false;
+  if (titleHasAny(title, DRINK)) return false;
+  if (titleHasAny(title, ALCOHOL)) return false;
+  if (dish.some((d) => ["drink", "beverage", "cocktail", "dessert"].includes(d)))
+    return false;
 
-    const used = it.usedIngredientCount ?? 0;
-    const time = it.readyInMinutes ?? 999;
-    if (used < 2) return false;
-    if (time > timeCap) return false;
+  const used = it.usedIngredientCount ?? 0;
+  const time = it.readyInMinutes ?? 999;
+  if (used < 2) return false;
+  if (time > timeCap) return false;
 
-    // stronger specific overlap
-    const matchSpecificCount = specific.filter((sp) =>
-      ingNames.some((n) => n.includes(sp))
-    ).length;
-    if (specific.length >= 3 && matchSpecificCount < 2) return false;
+  // stronger specific overlap
+  const matchSpecificCount = specific.filter((sp) =>
+    ingNames.some((n) => n.includes(sp))
+  ).length;
+  if (specific.length >= 3 && matchSpecificCount < 2) return false;
 
-    // no fish dishes if we don't have fish
-    if (/shrimp|prawn|salmon|tuna|anchovy|sardine/.test(title) &&
-        !pantry.some((p) => ["shrimp","prawn","salmon","tuna","fish"].includes(p))) {
-      return false;
-    }
-
-    // main words guard: e.g. mushroom recipes require mushrooms
-    const titleWords = title.split(/[^a-z]+/g).filter(Boolean);
-    for (const w of MAIN_WORDS) {
-      if (titleWords.includes(w)) {
-        const hasMain = [...pantrySet].some((p) => p.includes(w));
-        if (!hasMain) return false;
-      }
-    }
-
-    // strict-ish pantry vs missing logic
-    let hit = 0;
-    let missing = 0;
-    const missingList = [];
-
-    for (const rawName of ingNames) {
-      const simple = rawName.replace(/[^a-z ]/g, "").trim();
-      if (!simple) continue;
-
-      const inPantry = [...pantrySet].some((p) => simple.includes(p));
-      const isStaple = [...staplesSet].some((p) => simple.includes(p));
-
-      if (inPantry) {
-        hit++;
-      } else if (isStaple) {
-        // ignore
-      } else {
-        missing++;
-        missingList.push(simple);
-      }
-    }
-
-    // relaxed mode:
-    // - at most 2 missing ingredients
-    // - must match majority of non-staple ingredients
-    if (missing > 2) return false;
-    if (hit < 2) return false;
-    if (hit + missing > 0 && hit / (hit + missing) < 0.6) return false;
-
-    // stash missing list for later mapping
-    it._dsMissing = missingList;
-    return true;
-  });
-
-  const scored = filtered.map((it) => {
-    const used = it.usedIngredientCount ?? 0;
-    const missed = it.missedIngredientCount ?? 0;
-    const time = it.readyInMinutes ?? 30;
-    const score =
-      0.7 * (used / (used + missed + 1)) +
-      0.3 * (1 - Math.min(time, 60) / 60);
-
-    const ingObjs = (it.extendedIngredients || []).map((ing) => {
-      const nm = String(ing.name || "").toLowerCase();
-      return { name: nm, have: pantry.includes(nm) };
-    });
-
-    const missingList = Array.isArray(it._dsMissing) ? it._dsMissing : [];
-
-    return {
-      id: String(it.id),
-      title: it.title,
-      time,
-      energy: "hob",
-      cost: 2.5,
-      score: Math.round(score * 100) / 100,
-      ingredients: ingObjs,
-      steps: (it.analyzedInstructions?.[0]?.steps || []).map((s, i) => ({
-        id: `${it.id}-s${i}`,
-        text: s.step,
-      })),
-      badges: ["web"],
-      shoppingList: missingList,
-    };
-  });
-
-  return {
-    results: scored,
-    info: { spoonacularRawCount: raw.length, kept: scored.length, timeCap },
-  };
-}
-
-/* ----------------------- LLM (JSON mode, fills remaining recipes) ----------------------- */
-async function llmRecipes(pantry, prefs, needed = 3) {
-  if (!OPENAI_API_KEY || needed <= 0) {
-    return { recipes: [], info: { reason: "no OPENAI_API_KEY or needed<=0" } };
+  // no fish dishes if we don't have fish
+  if (
+    /shrimp|prawn|salmon|tuna|anchovy|sardine/.test(title) &&
+    !pantry.some((p) => ["shrimp", "prawn", "salmon", "tuna", "fish"].includes(p))
+  ) {
+    return false;
   }
 
-  const staples = ALLOWED_EXTRAS;
-  const maxRecipes = Math.min(needed, 3);
+  // main words guard: e.g. mushroom recipes require mushrooms
+  const titleWords = title.split(/[^a-z]+/g).filter(Boolean);
+  for (const w of MAIN_WORDS) {
+    if (titleWords.includes(w)) {
+      const hasMain = [...pantrySet].some((p) => p.includes(w));
+      if (!hasMain) return false;
+    }
+  }
 
-  const system = [
-    "You are DinnerSnap, a world-class chef and recipe developer.",
-    "You create simple, tasty DINNER recipes using the ingredients the user already has.",
-    "Prefer one-pot or low-faff meals real families can cook on weeknights.",
-  ].join(" ");
+  // strict-ish pantry vs missing logic
+  let hit = 0;
+  let missing = 0;
+  const missingList = [];
 
-  const user = [
-    "Pantry ingredients (user has these):",
-    JSON.stringify(pantry),
-    "",
-    "Rules:",
-    "- You may ONLY use ingredients from that list, plus water, salt, pepper and oil.",
-    "- Do not use any other ingredients under any circumstances.",
-    "- If the pantry is limited, still produce realistic, comforting recipes.",
-    "",
-    `Return up to ${maxRecipes} recipes in this JSON format:`,
-    '{ "recipes": [ { "id": "string", "title": "string", "time": 20, "cost": 2.5, "energy": "hob", "ingredients": [ { "name": "string" } ], "shoppingList": [], "steps": [ { "id": "s1", "text": "..." } ] } ] }',
-  ].join("\n");
+  for (const rawName of ingNames) {
+    const simple = rawName.replace(/[^a-z ]/g, "").trim();
+    if (!simple) continue;
+
+    const inPantry = [...pantrySet].some((p) => simple.includes(p));
+    const isStaple = [...staplesSet].some((p) => simple.includes(p));
+
+    if (inPantry) {
+      hit++;
+    } else if (isStaple) {
+      // ignore
+    } else {
+      missing++;
+      missingList.push(simple);
+    }
+  }
+
+  // relaxed mode:
+  // - at most 2 missing ingredients
+  // - must match majority of non-staple ingredients
+  if (missing > 2) return false;
+  if (hit < 2) return false;
+  if (hit + missing > 0 && hit / (hit + missing) < 0.6) return false;
+
+  // stash missing list for later mapping (shopping list)
+  it._dsMissing = missingList;
+  return true;
+});
+
+// 🔹 If our strict filters killed everything but Spoonacular did return recipes,
+// fall back to the raw list so the user still gets something.
+const baseList = filtered.length ? filtered : raw;
+
+// 🔹 Score whichever list we’re using, and map shoppingList if available
+const scored = baseList.map((it) => {
+  const used = it.usedIngredientCount ?? 0;
+  const missed = it.missedIngredientCount ?? 0;
+  const time = it.readyInMinutes ?? 30;
+  const score =
+    0.7 * (used / (used + missed + 1)) +
+    0.3 * (1 - Math.min(time, 60) / 60);
+
+  const ingObjs = (it.extendedIngredients || []).map((ing) => {
+    const nm = String(ing.name || "").toLowerCase();
+    return { name: nm, have: pantry.includes(nm) };
+  });
+
+  const missingList = Array.isArray(it._dsMissing) ? it._dsMissing : [];
+
+  return {
+    id: String(it.id),
+    title: it.title,
+    time,
+    energy: "hob",
+    cost: 2.5,
+    score: Math.round(score * 100) / 100,
+    ingredients: ingObjs,
+    steps: (it.analyzedInstructions?.[0]?.steps || []).map((s, i) => ({
+      id: `${it.id}-s${i}`,
+      text: s.step,
+    })),
+    badges: ["web"],
+    shoppingList: missingList,
+  };
+});
+
+return {
+  results: scored,
+  info: {
+    spoonacularRawCount: raw.length,
+    kept: scored.length,
+    timeCap,
+    usedFallback: !filtered.length && raw.length > 0,
+  },
+};
+
+
+/* ----------------------- LLM (JSON mode, fills remaining recipes) ----------------------- */
+async function llmRecipes(pantry, prefs) {
+  if (!OPENAI_API_KEY)
+    return { recipes: [], info: { reason: "no OPENAI_API_KEY" } };
 
   const body = {
     model: "gpt-4o-mini",
-    response_format: { type: "json_object" },
     temperature: 0.4,
-    max_tokens: 900,
+    max_tokens: 700,
+    response_format: { type: "json_object" },
     messages: [
-      { role: "system", content: system },
-      { role: "user", content: user },
+      {
+        role: "system",
+        content:
+          "You are DinnerSnap, a world-class savoury dinner chef. You ONLY create realistic recipes that can be made using the given pantry ingredients and a few universal basics like water, oil, salt and pepper.",
+      },
+      {
+        role: "user",
+        content:
+          `Given this pantry: ${pantry.join(
+            ", "
+          )}, create 1–2 DINNER recipes as a JSON object with this exact shape:\n` +
+          `{\n  "recipes": [\n    {\n      "id": "string",\n      "title": "string",\n      "time": 10–60,\n      "cost": 1–5,\n      "energy": "hob" | "oven" | "air fryer",\n      "ingredients": [{ "name": "string" }],\n      "steps": [{ "id": "string", "text": "string" }]\n    }\n  ]\n}\n\n` +
+          "Use ONLY the pantry ingredients plus universal basics. Do not invent extra ingredients.",
+      },
     ],
   };
 
@@ -480,75 +482,52 @@ async function llmRecipes(pantry, prefs, needed = 3) {
       2500,
       "llm-timeout"
     );
+
     const j = await r.json();
+
+    if (j?.error) {
+      console.log("LLM API error:", j.error);
+      return { recipes: [], info: { error: j.error.message || "openai-error" } };
+    }
+
     const raw = j?.choices?.[0]?.message?.content;
+    if (!raw) {
+      console.log("LLM empty content:", j);
+      return { recipes: [], info: { error: "no-content" } };
+    }
 
-if (j?.error) {
-  console.log("LLM API error:", j.error);
-  return { recipes: [], info: { error: j.error.message || "openai-error" } };
-}
-if (!raw) {
-  console.log("LLM empty content:", j);
-  return { recipes: [], info: { error: "no content" } };
-}
-
-
-
-    let root;
+    let parsed;
     try {
-      root = JSON.parse(raw);
+      parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
     } catch (e) {
-      return { recipes: [], info: { error: "invalid JSON from LLM" } };
+      console.log("LLM JSON parse error:", e, "raw:", raw);
+      return { recipes: [], info: { error: "json-parse-error" } };
     }
 
-    let list = [];
-    if (Array.isArray(root?.recipes)) {
-      list = root.recipes;
-    } else if (root && typeof root === "object") {
-      list = [root];
-    }
-
-    const out = list.slice(0, maxRecipes).map((rec, idx) => {
-      const id = String(rec.id || `llm-${Date.now()}-${idx}`);
-      const time = Number.isFinite(rec.time) ? rec.time : 20;
-      const cost = Number.isFinite(rec.cost) ? rec.cost : 2.0;
-      const energy = typeof rec.energy === "string" ? rec.energy : "hob";
-
-      const ingredients = Array.isArray(rec.ingredients)
-        ? rec.ingredients.map((i) => {
-            const nm = String(i.name || "").toLowerCase();
-            return { name: nm, have: pantry.includes(nm) };
-          })
-        : pantry.map((p) => ({ name: p, have: true }));
-
-      const steps = Array.isArray(rec.steps)
-        ? rec.steps.map((s, i) => ({
-            id: s.id || `step-${i}`,
-            text: s.text || String(s),
-          }))
-        : [
-            { id: "step-0", text: "Combine your pantry ingredients and cook until done." },
-          ];
-
-      const shoppingList = Array.isArray(rec.shoppingList)
-        ? rec.shoppingList.map((x) => String(x))
-        : [];
-
+    const list = Array.isArray(parsed.recipes) ? parsed.recipes : [];
+    const cleaned = list.map((rec, idx) => {
+      const id = rec.id || `llm-${Date.now()}-${idx}`;
       return {
         id,
-        title: String(rec.title || "Pantry Dinner"),
-        time,
-        cost,
-        energy,
-        ingredients,
-        steps,
+        title: rec.title || "LLM recipe",
+        time: rec.time ?? 20,
+        cost: rec.cost ?? 2,
+        energy: rec.energy || "hob",
+        ingredients: (rec.ingredients || []).map((i) => {
+          const nm = String(i.name || "").toLowerCase();
+          return { name: nm, have: pantry.includes(nm) };
+        }),
+        steps: (rec.steps || []).map((s, i) => ({
+          id: s.id || `${id}-s${i}`,
+          text: s.text || String(s),
+        })),
         badges: ["llm"],
-        shoppingList,
       };
     });
 
-    return { recipes: out, info: { ok: true } };
+    return { recipes: cleaned, info: { ok: true } };
   } catch (e) {
+    console.log("LLM fetch error:", String(e?.message || e));
     return { recipes: [], info: { error: String(e?.message || e) } };
   }
 }
@@ -565,32 +544,56 @@ function emergencyRecipe(pantry) {
   const title =
     (titleBits.length ? titleBits.join(" ") : "Pantry") + " Savoury Skillet";
 
-  const baseIngs = [
-    { name: "onion (or onion powder)", have: pantrySet.has("onion") },
-    { name: "garlic (or garlic powder)", have: pantrySet.has("garlic") },
-    { name: "ginger (or ground ginger)", have: pantrySet.has("ginger") },
-    {
+  const baseIngs = [];
+
+  if (!pantrySet.has("onion")) {
+    baseIngs.push({
+      name: "onion (or onion powder)",
+      have: pantrySet.has("onion"),
+    });
+  }
+  if (!pantrySet.has("garlic")) {
+    baseIngs.push({
+      name: "garlic (or garlic powder)",
+      have: pantrySet.has("garlic"),
+    });
+  }
+  if (!pantrySet.has("ginger")) {
+    baseIngs.push({
+      name: "ginger (or ground ginger)",
+      have: pantrySet.has("ginger"),
+    });
+  }
+  if (!pantrySet.has("mixed dried herbs")) {
+    baseIngs.push({
       name: "mixed dried herbs",
       have: pantrySet.has("mixed dried herbs"),
-    },
-    { name: "stock cube", have: pantrySet.has("stock cube") },
-    {
+    });
+  }
+  if (!pantrySet.has("stock cube")) {
+    baseIngs.push({
+      name: "stock cube",
+      have: pantrySet.has("stock cube"),
+    });
+  }
+  if (!pantrySet.has("lemon") && !pantrySet.has("vinegar")) {
+    baseIngs.push({
       name: "lemon or vinegar",
       have: pantrySet.has("lemon") || pantrySet.has("vinegar"),
-    },
-    {
+    });
+  }
+  if (!pantrySet.has("salt") && !pantrySet.has("pepper")) {
+    baseIngs.push({
       name: "salt & black pepper",
       have:
         pantrySet.has("salt") ||
         pantrySet.has("black pepper") ||
         pantrySet.has("pepper"),
-    },
-  ];
+    });
+  }
 
-  // pantry items as {name,have:true}
   const uniqPantry = pantry.map((p) => ({ name: p, have: true }));
 
-  // dedupe by name so we don’t get “salt” twice etc.
   const combined = [...uniqPantry, ...baseIngs];
   const seen = new Set();
   const ingredients = [];
@@ -601,7 +604,6 @@ function emergencyRecipe(pantry) {
     ingredients.push(ing);
   }
 
-  // show a few example pantry items in step text
   const sample = pantry.slice(0, 4).join(", ") || "your pantry items";
 
   return {
@@ -629,6 +631,8 @@ function emergencyRecipe(pantry) {
     shoppingList: [],
   };
 }
+
+
 
 /* ----------------------- Handler ----------------------- */
 export default async function handler(req, res) {
@@ -719,12 +723,22 @@ pantry = cleanPantry(withCombos);
       console.log("spoon end in", nowMs() - s0, "ms kept=", sp.info?.kept);
       return sp.results || [];
     })();
-    const llmP = (async () => {
-      const l0 = nowMs();
-      const llm = await llmRecipes(pantry, prefs, 3);
-      console.log("llm end in", nowMs() - l0, "ms ok=", (llm.recipes || []).length > 0);
-      return llm.recipes || [];
-    })();
+
+
+   const llmP = (async () => {
+  const l0 = nowMs();
+  const llm = await llmRecipes(pantry, prefs);
+  console.log(
+    "llm end in",
+    nowMs() - l0,
+    "ms count=",
+    (llm.recipes || []).length,
+    "info=",
+    llm.info
+  );
+  return llm.recipes || [];
+})();
+
 
     let spoonList = [];
     let llmList = [];
@@ -737,25 +751,29 @@ pantry = cleanPantry(withCombos);
       // ignore
     }
 
-    let combined = [];
+  let combined = [];
 
-    if (spoonList.length) {
-      combined = spoonList.slice(0, 3);
-    }
+// Start with Spoonacular
+if (spoonList.length) combined = spoonList;
 
-    if (combined.length < 3 && llmList.length) {
-      for (const rec of llmList) {
-        if (!combined.find((r) => r.id === rec.id)) {
-          combined.push(rec);
-          if (combined.length >= 3) break;
-        }
-      }
+// Add LLM recipes if they exist, avoiding duplicate ids
+if (llmList.length) {
+  for (const rec of llmList) {
+    if (!combined.find((r) => r.id === rec.id)) {
+      combined.push(rec);
     }
+  }
+}
 
-    // Always ensure 3 recipes
-    while (combined.length < 3) {
-      combined.push(emergencyRecipe(pantry));
-    }
+// Fallback: emergency recipe if nothing from web/LLM
+if (!combined.length) {
+  combined = [emergencyRecipe(pantry)];
+}
+
+// Keep at most 3 total
+if (combined.length > 3) combined = combined.slice(0, 3);
+
+
 
     const debug = {
       source,
