@@ -36,7 +36,7 @@ function tfetch(url, opts = {}, ms = 2500, label = "fetch-timeout") {
   return withTimeout((signal) => fetch(url, { ...opts, signal }), ms, label);
 }
 
-// Read raw body from Node req and JSON.parse it, with a simple size guard.
+// Read raw body from Node req and JSON.parse it, with a size guard.
 function readJsonBody(req, maxChars = 3_500_000) {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -59,22 +59,43 @@ function readJsonBody(req, maxChars = 3_500_000) {
   });
 }
 
-/* ----------------------- Classifiers ----------------------- */
+/* ----------------------- Classifiers & constants ----------------------- */
 const DESSERT = new Set([
   "dessert","pudding","ice cream","smoothie","shake","cookie","brownie","cupcake","cake",
   "muffin","pancake","waffle","jam","jelly","compote","truffle","fudge","sorbet","parfait",
-  "custard","tart","shortbread","licorice","cobbler"
+  "custard","tart","shortbread","licorice","cobbler",
 ]);
 const DRINK   = new Set([
-  "drink","beverage","mocktail","cocktail","margarita","mojito","spritzer","soda","punch","toddy"
+  "drink","beverage","mocktail","cocktail","margarita","mojito","spritzer","soda","punch","toddy",
 ]);
 const ALCOHOL = new Set([
   "brandy","rum","vodka","gin","whisky","whiskey","bourbon","tequila","wine","liqueur",
-  "amaretto","cognac","port","sherry"
+  "amaretto","cognac","port","sherry",
 ]);
 const GENERIC = new Set(["pasta","rice","bread","flour","sugar","oil","salt","pepper"]);
 const MEAT    = new Set(["chicken","beef","pork","lamb","bacon","ham","turkey","shrimp","prawn","salmon","tuna","fish"]);
 const PASTA   = new Set(["pasta","spaghetti","macaroni","penne","farfalle","orzo","fusilli","linguine","tagliatelle"]);
+
+// “Main words” that, if in the title but not in pantry, we reject the recipe
+const MAIN_WORDS = new Set([
+  "mushroom","mushrooms",
+  "chicken","beef","pork","lamb","bacon","ham","turkey","sausage",
+  "salmon","tuna","prawn","shrimp",
+]);
+
+// Staples that we treat as “everyone has” (don’t count as missing)
+const ALLOWED_EXTRAS = [
+  "water",
+  "salt",
+  "pepper",
+  "oil",
+  "olive oil",
+  "butter",
+  "sugar",
+  "flour",
+  "stock",
+  "stock cube",
+];
 
 const titleHasAny = (title, set) => {
   const t = String(title || "").toLowerCase();
@@ -216,6 +237,23 @@ function cleanPantry(raw) {
   return [...out];
 }
 
+// Combine common multi-word ingredients from OCR tokens
+function addPhraseCombos(tokens) {
+  const set = new Set(tokens.map((t) => String(t).toLowerCase()));
+  const out = new Set(set);
+
+  // coconut + milk => coconut milk
+  if (set.has("coconut") && set.has("milk")) {
+    out.add("coconut milk");
+  }
+  // kidney + beans => kidney beans
+  if (set.has("kidney") && set.has("beans")) {
+    out.add("kidney beans");
+  }
+
+  return [...out];
+}
+
 /* ----------------------- Spoonacular ----------------------- */
 async function spoonacularRecipes(pantry, prefs) {
   if (!SPOON_KEY) return { results: [], info: { note: "no SPOON_KEY" } };
@@ -248,25 +286,79 @@ async function spoonacularRecipes(pantry, prefs) {
   const raw = Array.isArray(j?.results) ? j.results : [];
   const specific = pantry.filter((p) => !GENERIC.has(p));
 
+  const pantrySet = new Set(pantry);
+  const staplesSet = new Set(ALLOWED_EXTRAS);
+
   const filtered = raw.filter((it) => {
     const title = String(it.title || "").toLowerCase();
     const dish = (it.dishTypes || []).map((d) => String(d).toLowerCase());
+    const ingNames = (it.extendedIngredients || []).map((ing) =>
+      String(ing.name || "").toLowerCase()
+    );
 
+    // basic filters
     if (titleHasAny(title, DESSERT)) return false;
     if (titleHasAny(title, DRINK)) return false;
     if (titleHasAny(title, ALCOHOL)) return false;
-    if (dish.some((d) => ["drink","beverage","cocktail","dessert"].includes(d))) return false;
+    if (dish.some((d) => ["drink", "beverage", "cocktail", "dessert"].includes(d))) return false;
 
     const used = it.usedIngredientCount ?? 0;
     const time = it.readyInMinutes ?? 999;
     if (used < 2) return false;
     if (time > timeCap) return false;
 
-    if (specific.length >= 2 && !hasSpecificTermInTitleOrIngredients(it, specific)) return false;
+    // stronger specific overlap
+    const matchSpecificCount = specific.filter((sp) =>
+      ingNames.some((n) => n.includes(sp))
+    ).length;
+    if (specific.length >= 3 && matchSpecificCount < 2) return false;
 
+    // no fish dishes if we don't have fish
     if (/shrimp|prawn|salmon|tuna|anchovy|sardine/.test(title) &&
-        !pantry.some((p) => ["shrimp","prawn","salmon","tuna","fish"].includes(p))) return false;
+        !pantry.some((p) => ["shrimp","prawn","salmon","tuna","fish"].includes(p))) {
+      return false;
+    }
 
+    // main words guard: e.g. mushroom recipes require mushrooms
+    const titleWords = title.split(/[^a-z]+/g).filter(Boolean);
+    for (const w of MAIN_WORDS) {
+      if (titleWords.includes(w)) {
+        const hasMain = [...pantrySet].some((p) => p.includes(w));
+        if (!hasMain) return false;
+      }
+    }
+
+    // strict-ish pantry vs missing logic
+    let hit = 0;
+    let missing = 0;
+    const missingList = [];
+
+    for (const rawName of ingNames) {
+      const simple = rawName.replace(/[^a-z ]/g, "").trim();
+      if (!simple) continue;
+
+      const inPantry = [...pantrySet].some((p) => simple.includes(p));
+      const isStaple = [...staplesSet].some((p) => simple.includes(p));
+
+      if (inPantry) {
+        hit++;
+      } else if (isStaple) {
+        // ignore
+      } else {
+        missing++;
+        missingList.push(simple);
+      }
+    }
+
+    // relaxed mode:
+    // - at most 2 missing ingredients
+    // - must match majority of non-staple ingredients
+    if (missing > 2) return false;
+    if (hit < 2) return false;
+    if (hit + missing > 0 && hit / (hit + missing) < 0.6) return false;
+
+    // stash missing list for later mapping
+    it._dsMissing = missingList;
     return true;
   });
 
@@ -278,6 +370,13 @@ async function spoonacularRecipes(pantry, prefs) {
       0.7 * (used / (used + missed + 1)) +
       0.3 * (1 - Math.min(time, 60) / 60);
 
+    const ingObjs = (it.extendedIngredients || []).map((ing) => {
+      const nm = String(ing.name || "").toLowerCase();
+      return { name: nm, have: pantry.includes(nm) };
+    });
+
+    const missingList = Array.isArray(it._dsMissing) ? it._dsMissing : [];
+
     return {
       id: String(it.id),
       title: it.title,
@@ -285,36 +384,58 @@ async function spoonacularRecipes(pantry, prefs) {
       energy: "hob",
       cost: 2.5,
       score: Math.round(score * 100) / 100,
-      ingredients: (it.extendedIngredients || []).map((ing) => {
-        const nm = String(ing.name || "").toLowerCase();
-        return { name: nm, have: pantry.includes(nm) };
-      }),
+      ingredients: ingObjs,
       steps: (it.analyzedInstructions?.[0]?.steps || []).map((s, i) => ({
         id: `${it.id}-s${i}`,
         text: s.step,
       })),
       badges: ["web"],
+      shoppingList: missingList,
     };
   });
 
-  return { results: scored, info: { spoonacularRawCount: raw.length, kept: scored.length, timeCap } };
+  return {
+    results: scored,
+    info: { spoonacularRawCount: raw.length, kept: scored.length, timeCap },
+  };
 }
 
-/* ----------------------- LLM ----------------------- */
-async function llmRecipe(pantry, prefs) {
-  if (!OPENAI_API_KEY)
-    return { recipe: null, info: { reason: "no OPENAI_API_KEY" } };
+/* ----------------------- LLM (JSON mode, fills remaining recipes) ----------------------- */
+async function llmRecipes(pantry, prefs, needed = 3) {
+  if (!OPENAI_API_KEY || needed <= 0) {
+    return { recipes: [], info: { reason: "no OPENAI_API_KEY or needed<=0" } };
+  }
+
+  const staples = ALLOWED_EXTRAS;
+  const maxRecipes = Math.min(needed, 3);
+
+  const system = [
+    "You are DinnerSnap, a world-class chef and recipe developer.",
+    "You create simple, tasty DINNER recipes using the ingredients the user already has.",
+    "Prefer one-pot or low-faff meals real families can cook on weeknights.",
+  ].join(" ");
+
+  const user = [
+    "Pantry ingredients (user has these):",
+    JSON.stringify(pantry),
+    "",
+    "Rules:",
+    "- You may ONLY use ingredients from that list, plus water, salt, pepper and oil.",
+    "- Do not use any other ingredients under any circumstances.",
+    "- If the pantry is limited, still produce realistic, comforting recipes.",
+    "",
+    `Return up to ${maxRecipes} recipes in this JSON format:`,
+    '{ "recipes": [ { "id": "string", "title": "string", "time": 20, "cost": 2.5, "energy": "hob", "ingredients": [ { "name": "string" } ], "shoppingList": [], "steps": [ { "id": "s1", "text": "..." } ] } ] }',
+  ].join("\n");
 
   const body = {
     model: "gpt-4o-mini",
-    temperature: 0.45,
-    max_tokens: 600,
+    response_format: { type: "json_object" },
+    temperature: 0.4,
+    max_tokens: 900,
     messages: [
-      { role: "system", content: "You write concise, savoury DINNER recipes only." },
-      {
-        role: "user",
-        content: `Create ONE savoury DINNER recipe using ${pantry.join(", ")}.`,
-      },
+      { role: "system", content: system },
+      { role: "user", content: user },
     ],
   };
 
@@ -333,25 +454,65 @@ async function llmRecipe(pantry, prefs) {
       "llm-timeout"
     );
     const j = await r.json();
-    const txt = j?.choices?.[0]?.message?.content || "";
-    const m = txt.match(/\{[\s\S]*\}$/);
-    if (!m) return { recipe: null, info: { error: "no JSON in completion" } };
-    const parsed = JSON.parse(m[0]);
-    parsed.id = parsed.id || `llm-${Date.now()}`;
-    parsed.energy = parsed.energy || "hob";
-    parsed.cost = parsed.cost ?? 2.0;
-    parsed.badges = Array.isArray(parsed.badges) ? parsed.badges : ["llm"];
-    parsed.ingredients = (parsed.ingredients || []).map((i) => {
-      const nm = String(i.name || "").toLowerCase();
-      return { name: nm, have: pantry.includes(nm) };
+    const raw = j?.choices?.[0]?.message?.content;
+    if (!raw) return { recipes: [], info: { error: "no content" } };
+
+    let root;
+    try {
+      root = JSON.parse(raw);
+    } catch (e) {
+      return { recipes: [], info: { error: "invalid JSON from LLM" } };
+    }
+
+    let list = [];
+    if (Array.isArray(root?.recipes)) {
+      list = root.recipes;
+    } else if (root && typeof root === "object") {
+      list = [root];
+    }
+
+    const out = list.slice(0, maxRecipes).map((rec, idx) => {
+      const id = String(rec.id || `llm-${Date.now()}-${idx}`);
+      const time = Number.isFinite(rec.time) ? rec.time : 20;
+      const cost = Number.isFinite(rec.cost) ? rec.cost : 2.0;
+      const energy = typeof rec.energy === "string" ? rec.energy : "hob";
+
+      const ingredients = Array.isArray(rec.ingredients)
+        ? rec.ingredients.map((i) => {
+            const nm = String(i.name || "").toLowerCase();
+            return { name: nm, have: pantry.includes(nm) };
+          })
+        : pantry.map((p) => ({ name: p, have: true }));
+
+      const steps = Array.isArray(rec.steps)
+        ? rec.steps.map((s, i) => ({
+            id: s.id || `step-${i}`,
+            text: s.text || String(s),
+          }))
+        : [
+            { id: "step-0", text: "Combine your pantry ingredients and cook until done." },
+          ];
+
+      const shoppingList = Array.isArray(rec.shoppingList)
+        ? rec.shoppingList.map((x) => String(x))
+        : [];
+
+      return {
+        id,
+        title: String(rec.title || "Pantry Dinner"),
+        time,
+        cost,
+        energy,
+        ingredients,
+        steps,
+        badges: ["llm"],
+        shoppingList,
+      };
     });
-    parsed.steps = (parsed.steps || []).map((s, i) => ({
-      id: s.id || `step-${i}`,
-      text: s.text || String(s),
-    }));
-    return { recipe: parsed, info: { ok: true } };
+
+    return { recipes: out, info: { ok: true } };
   } catch (e) {
-    return { recipe: null, info: { error: String(e?.message || e) } };
+    return { recipes: [], info: { error: String(e?.message || e) } };
   }
 }
 
@@ -359,7 +520,7 @@ async function llmRecipe(pantry, prefs) {
 function emergencyRecipe(pantry) {
   const titleBits = [];
   if (pantry.some((p) => p.includes("chickpea"))) titleBits.push("Chickpea");
-  if (pantry.includes("coconut cream")) titleBits.push("Coconut");
+  if (pantry.includes("coconut cream") || pantry.includes("coconut milk")) titleBits.push("Coconut");
   if (pantry.some((p) => PASTA.has(p))) titleBits.push("Spaghetti");
   const title =
     (titleBits.length ? titleBits.join(" ") : "Pantry") + " Savoury Skillet";
@@ -391,6 +552,7 @@ function emergencyRecipe(pantry) {
       { id: "s2", text: "Add pantry items and simmer 6–8 min." },
     ],
     badges: ["local"],
+    shoppingList: [],
   };
 }
 
@@ -438,11 +600,13 @@ export default async function handler(req, res) {
           labels: visRes.labels,
           objects: visRes.objects,
         };
-        pantry = cleanPantry([
+        const rawTokens = [
           ...(visRes.ocrTokens || []),
           ...(visRes.labels || []),
           ...(visRes.objects || []),
-        ]);
+        ];
+        const withCombos = addPhraseCombos(rawTokens);
+        pantry = cleanPantry(withCombos);
         source = "vision";
         console.log("vision ok in", nowMs() - v0, "ms pantry=", pantry);
       } catch (e) {
@@ -479,9 +643,9 @@ export default async function handler(req, res) {
     })();
     const llmP = (async () => {
       const l0 = nowMs();
-      const llm = await llmRecipe(pantry, prefs);
-      console.log("llm end in", nowMs() - l0, "ms ok=", !!llm.recipe);
-      return llm.recipe ? [llm.recipe] : [];
+      const llm = await llmRecipes(pantry, prefs, 3);
+      console.log("llm end in", nowMs() - l0, "ms ok=", (llm.recipes || []).length > 0);
+      return llm.recipes || [];
     })();
 
     let spoonList = [];
@@ -496,7 +660,11 @@ export default async function handler(req, res) {
     }
 
     let combined = [];
-    if (spoonList.length) combined = spoonList;
+
+    if (spoonList.length) {
+      combined = spoonList.slice(0, 3);
+    }
+
     if (combined.length < 3 && llmList.length) {
       for (const rec of llmList) {
         if (!combined.find((r) => r.id === rec.id)) {
@@ -505,8 +673,11 @@ export default async function handler(req, res) {
         }
       }
     }
-    if (!combined.length) combined = [emergencyRecipe(pantry)];
-    else if (combined.length > 3) combined = combined.slice(0, 3);
+
+    // Always ensure 3 recipes
+    while (combined.length < 3) {
+      combined.push(emergencyRecipe(pantry));
+    }
 
     const debug = {
       source,
