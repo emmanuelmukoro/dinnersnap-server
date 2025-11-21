@@ -758,11 +758,25 @@ export default async function handler(req) {
   const t0 = nowMs();
   if (req.method !== "POST") return json(405, { error: "POST only" });
 
+   // --- SAFE BODY PARSE WITH TIMEOUT + SIZE GUARD ---
   let body;
   try {
-    body = await req.json();
+    const bodyObj = await withTimeout(
+      () => req.json(),
+      3000,                 // 3s max to read + parse body
+      "body-timeout"
+    );
+    body = bodyObj || {};
   } catch (e) {
-    return json(400, { error: "invalid JSON" });
+    console.log("body parse timeout or error:", String(e?.message || e));
+    return json(408, { error: "body-timeout" });
+  }
+
+  // Optional: basic size guard on base64 image if present
+  const base64Len = body?.imageBase64 ? String(body.imageBase64).length : 0;
+  if (base64Len > 3_500_000) {
+    console.log("payload-too-large base64Len=", base64Len);
+    return json(413, { error: "payload-too-large" });
   }
 
   const { imageBase64, pantryOverride, prefs = {} } = body || {};
