@@ -42,6 +42,37 @@ function tfetch(url, opts = {}, ms = 2500, label = "fetch-timeout") {
   );
 }
 
+// Read raw body from Node.js request with timeout + length guard
+function readBodyNode(
+  req,
+  { timeoutMs = 3000, maxLength = 3_500_000 } = {}
+) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    const timer = setTimeout(() => {
+      reject(new Error("body-timeout"));
+    }, timeoutMs);
+
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (maxLength && body.length > maxLength) {
+        clearTimeout(timer);
+        reject(new Error("payload-too-large"));
+      }
+    });
+
+    req.on("end", () => {
+      clearTimeout(timer);
+      resolve(body);
+    });
+
+    req.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
 /* ----------------------- Classifiers ----------------------- */
 const DESSERT = new Set([
   "dessert",
@@ -758,25 +789,28 @@ export default async function handler(req) {
   const t0 = nowMs();
   if (req.method !== "POST") return json(405, { error: "POST only" });
 
-   // --- SAFE BODY PARSE WITH TIMEOUT + SIZE GUARD ---
-  let body;
+  // --- SAFE BODY PARSE (NODE REQUEST) WITH TIMEOUT + SIZE GUARD ---
+  let rawBody;
   try {
-    const bodyObj = await withTimeout(
-      () => req.json(),
-      3000,                 // 3s max to read + parse body
-      "body-timeout"
-    );
-    body = bodyObj || {};
+    rawBody = await readBodyNode(req, {
+      timeoutMs: 3000,
+      maxLength: 3_500_000, // ~2.6 MB binary when base64
+    });
   } catch (e) {
-    console.log("body parse timeout or error:", String(e?.message || e));
+    const msg = String(e?.message || e);
+    console.log("body parse error:", msg);
+    if (msg === "payload-too-large") {
+      return json(413, { error: "payload-too-large" });
+    }
     return json(408, { error: "body-timeout" });
   }
 
-  // Optional: basic size guard on base64 image if present
-  const base64Len = body?.imageBase64 ? String(body.imageBase64).length : 0;
-  if (base64Len > 3_500_000) {
-    console.log("payload-too-large base64Len=", base64Len);
-    return json(413, { error: "payload-too-large" });
+  let body;
+  try {
+    body = rawBody ? JSON.parse(rawBody) : {};
+  } catch (e) {
+    console.log("JSON parse error:", String(e?.message || e));
+    return json(400, { error: "invalid JSON" });
   }
 
   const { imageBase64, pantryOverride, prefs = {} } = body || {};
