@@ -190,7 +190,7 @@ async function callVision(imageBase64) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     },
-    2500,
+    8000,
     "vision-timeout"
   );
 
@@ -791,27 +791,35 @@ export default async function handler(req) {
 
   // --- SAFE BODY PARSE (NODE REQUEST) WITH TIMEOUT + SIZE GUARD ---
   let rawBody;
-  try {
-    rawBody = await readBodyNode(req, {
-      timeoutMs: 3000,
-      maxLength: 3_500_000, // ~2.6 MB binary when base64
-    });
-  } catch (e) {
-    const msg = String(e?.message || e);
-    console.log("body parse error:", msg);
-    if (msg === "payload-too-large") {
-      return json(413, { error: "payload-too-large" });
-    }
-    return json(408, { error: "body-timeout" });
-  }
+try {
+  rawBody = await readBodyNode(req, {
+    timeoutMs: 3000,
+    maxLength: 3_500_000, // ~2.6 MB binary when base64
+  });
+} catch (e) {
+  const msg = String(e?.message || e);
+  console.log("body parse error:", msg);
+  const fallback = emergencyRecipe([]);
+  return json(200, {
+    pantry: [],
+    recipes: [fallback],
+    debug: { source: "body-parse-fail", error: msg },
+  });
+}
 
-  let body;
-  try {
-    body = rawBody ? JSON.parse(rawBody) : {};
-  } catch (e) {
-    console.log("JSON parse error:", String(e?.message || e));
-    return json(400, { error: "invalid JSON" });
-  }
+let body;
+try {
+  body = rawBody ? JSON.parse(rawBody) : {};
+} catch (e) {
+  const msg = String(e?.message || e);
+  console.log("JSON parse error:", msg);
+  const fallback = emergencyRecipe([]);
+  return json(200, {
+    pantry: [],
+    recipes: [fallback],
+    debug: { source: "json-parse-fail", error: msg },
+  });
+}
 
   const { imageBase64, pantryOverride, prefs = {} } = body || {};
   const watchdogMs = 12000;
