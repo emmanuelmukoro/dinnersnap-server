@@ -633,7 +633,7 @@ async function llmRecipes(pantry, prefs) {
         },
         body: JSON.stringify(body),
       },
-      4500,
+      8000,
       "llm-timeout"
     );
 
