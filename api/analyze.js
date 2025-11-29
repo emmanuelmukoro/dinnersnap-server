@@ -633,7 +633,7 @@ async function llmRecipes(pantry, prefs) {
         },
         body: JSON.stringify(body),
       },
-      8000,
+      11000,
       "llm-timeout"
     );
 
@@ -822,7 +822,7 @@ try {
 }
 
   const { imageBase64, pantryOverride, prefs = {} } = body || {};
-  const watchdogMs = 12000;
+  const watchdogMs = 19000;
 
   const main = async () => {
     const tStart = nowMs();
