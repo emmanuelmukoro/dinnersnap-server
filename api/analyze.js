@@ -1,6 +1,5 @@
-// api/analyze.js
-// ESM-only Node function for Vercel.
-// Vision -> cleaned pantry -> Spoonacular + LLM -> emergency fallback.
+// /api/analyze.js
+// Node runtime + classic req/res handler so Vercel actually sends a response.
 
 export const config = {
   runtime: "nodejs",
@@ -15,62 +14,81 @@ const SPOON_KEY = process.env.SPOON_KEY || process.env.SPOONACULAR_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 /* ----------------------- Helpers ----------------------- */
-const json = (status, obj) =>
-  new Response(JSON.stringify(obj), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-
 const nowMs = () => Number(process.hrtime.bigint() / 1000000n);
 
+function sendJson(res, status, obj) {
+  const data = JSON.stringify(obj);
+  res.statusCode = status;
+  res.setHeader("content-type", "application/json");
+  res.setHeader("content-length", Buffer.byteLength(data));
+  res.end(data);
+}
+
 function withTimeout(run, ms, label = "timeout") {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  return Promise.race([
-    run(controller.signal),
-    new Promise((_, rej) =>
-      setTimeout(() => rej(new Error(label)), ms + 10)
-    ),
-  ]).finally(() => clearTimeout(timer));
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    const timer = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      reject(new Error(label));
+    }, ms);
+
+    Promise.resolve()
+      .then(run)
+      .then((val) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        resolve(val);
+      })
+      .catch((err) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
 }
 
 function tfetch(url, opts = {}, ms = 2500, label = "fetch-timeout") {
-  return withTimeout(
-    (signal) => fetch(url, { ...opts, signal }),
-    ms,
-    label
-  );
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+
+  return fetch(url, { ...opts, signal: controller.signal })
+    .finally(() => clearTimeout(timer))
+    .catch((e) => {
+      throw new Error(label + ": " + (e?.message || String(e)));
+    });
 }
 
-// Read raw body from Node.js request with timeout + length guard
-function readBodyNode(
-  req,
-  { timeoutMs = 3000, maxLength = 3_500_000 } = {}
-) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    const timer = setTimeout(() => {
-      reject(new Error("body-timeout"));
-    }, timeoutMs);
-
-    req.on("data", (chunk) => {
-      body += chunk;
-      if (maxLength && body.length > maxLength) {
-        clearTimeout(timer);
-        reject(new Error("payload-too-large"));
+// Safe JSON body reader for Node req
+async function readJsonBody(req, timeoutMs = 3000) {
+  return withTimeout(
+    async () => {
+      const chunks = [];
+      for await (const chunk of req) {
+        chunks.push(chunk);
       }
-    });
+      const bodyStr = Buffer.concat(chunks).toString("utf8");
 
-    req.on("end", () => {
-      clearTimeout(timer);
-      resolve(body);
-    });
+      if (bodyStr && bodyStr.length > 3_500_000) {
+        const err = new Error("payload-too-large");
+        err.code = "PAYLOAD_TOO_LARGE";
+        throw err;
+      }
 
-    req.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
+      if (!bodyStr) return {};
+      try {
+        return JSON.parse(bodyStr);
+      } catch (e) {
+        const err = new Error("invalid-json");
+        err.code = "INVALID_JSON";
+        throw err;
+      }
+    },
+    timeoutMs,
+    "body-timeout"
+  );
 }
 
 /* ----------------------- Classifiers ----------------------- */
@@ -143,37 +161,17 @@ const MEAT = new Set([
   "tuna",
   "fish",
 ]);
-const PASTA = new Set([
-  "pasta",
-  "spaghetti",
-  "macaroni",
-  "penne",
-  "farfalle",
-  "orzo",
-  "fusilli",
-  "linguine",
-  "tagliatelle",
-]);
 
-const MAIN_WORDS = new Set(["mushroom", "broccoli", "courgette", "spinach"]);
-
-const titleHasAny = (title, set) => {
-  const t = String(title || "").toLowerCase();
-  for (const w of set) if (t.includes(w)) return true;
-  return false;
-};
-
-/* ----------------------- Vision ----------------------- */
+/* ----------------------- Vision (2.5s) ----------------------- */
 async function callVision(imageBase64) {
-  if (!GCV_KEY)
+  if (!GCV_KEY) {
     return { ocrTokens: [], labels: [], objects: [], error: "no GCV_KEY" };
+  }
 
   const body = {
     requests: [
       {
-        image: {
-          content: imageBase64.replace(/^data:image\/\w+;base64,/, ""),
-        },
+        image: { content: String(imageBase64 || "").replace(/^data:image\/\w+;base64,/, "") },
         features: [
           { type: "TEXT_DETECTION", maxResults: 1 },
           { type: "LABEL_DETECTION", maxResults: 10 },
@@ -190,11 +188,11 @@ async function callVision(imageBase64) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     },
-    8000,
+    2500,
     "vision-timeout"
   );
 
-  const j = await r.json();
+  const j = await r.json().catch(() => ({}));
   const res = j?.responses?.[0] || {};
 
   const rawText = (res.textAnnotations?.[0]?.description || "").toLowerCase();
@@ -219,6 +217,7 @@ async function callVision(imageBase64) {
     "broccoli",
     "banana",
     "tomato",
+    "tomatoes",
     "onion",
     "garlic",
     "squash",
@@ -241,12 +240,10 @@ async function callVision(imageBase64) {
     "avocado",
     "coconut",
     "cream",
-    "seasoning",
+    "egg",
   ]);
 
-  const ocrTokens = RAW_TOKENS.filter(
-    (t) => t.length >= 3 && FOODISH.has(t)
-  );
+  const ocrTokens = RAW_TOKENS.filter((t) => t.length >= 3 && FOODISH.has(t));
   const labels = (res.labelAnnotations || [])
     .map((x) => x.description?.toLowerCase())
     .filter(Boolean);
@@ -257,14 +254,13 @@ async function callVision(imageBase64) {
   return { ocrTokens, labels, objects };
 }
 
-/* ----------------------- Pantry helpers ----------------------- */
+/* ----------------------- Pantry cleanup ----------------------- */
 const WHITELIST = [
   "banana",
   "broccoli",
   "chickpeas",
   "beans",
   "kidney beans",
-  "red kidney beans",
   "tomatoes",
   "onion",
   "garlic",
@@ -319,7 +315,6 @@ const WHITELIST = [
   "butter",
   "salt",
   "pepper",
-  "black pepper",
   "stock cube",
   "curry powder",
   "mixed dried herbs",
@@ -377,46 +372,6 @@ function nearestWhitelistStrict(term) {
   return bestDist <= 1 ? best : null;
 }
 
-function addPhraseCombos(tokens) {
-  const lower = tokens.map((t) => String(t).toLowerCase());
-  const joined = lower.join(" ");
-  const extra = [];
-
-  if (joined.includes("coconut") && joined.includes("milk")) {
-    extra.push("coconut milk");
-  }
-
-  if (
-    joined.includes("red") &&
-    joined.includes("kidney") &&
-    joined.includes("beans")
-  ) {
-    extra.push("kidney beans", "red kidney beans");
-  }
-
-  return [...lower, ...extra];
-}
-
-function stripMeatWhenSeasoning(tokens) {
-  const lower = tokens.map((t) => String(t).toLowerCase());
-  const hasSeasoning = lower.some((t) =>
-    /seasoning|stock|bouillon|gravy/.test(t)
-  );
-  if (!hasSeasoning) return lower;
-
-  const meatWords = new Set([
-    "beef",
-    "chicken",
-    "lamb",
-    "pork",
-    "ham",
-    "turkey",
-    "steak",
-  ]);
-
-  return lower.filter((t) => !meatWords.has(t));
-}
-
 function cleanPantry(raw) {
   const out = new Set();
   for (const t0 of uniqLower(raw)) {
@@ -460,92 +415,45 @@ async function spoonacularRecipes(pantry, prefs) {
   let j = {};
   try {
     const r = await tfetch(url.toString(), {}, 2000, "spoon-timeout");
-    j = await r.json();
+    j = await r.json().catch(() => ({}));
   } catch (e) {
+    console.log("spoon error:", e?.message || e);
     return { results: [], info: { error: String(e?.message || e) } };
   }
 
   const raw = Array.isArray(j?.results) ? j.results : [];
   const specific = pantry.filter((p) => !GENERIC.has(p));
-  const pantrySet = new Set(pantry);
-  const staplesSet = new Set(["water", "salt", "pepper", "oil"]);
 
   const filtered = raw.filter((it) => {
     const title = String(it.title || "").toLowerCase();
     const dish = (it.dishTypes || []).map((d) => String(d).toLowerCase());
-    const ingNames = (it.extendedIngredients || []).map((ing) =>
-      String(ing.name || "").toLowerCase()
-    );
 
-    // basic filters
-    if (titleHasAny(title, DESSERT)) return false;
-    if (titleHasAny(title, DRINK)) return false;
-    if (titleHasAny(title, ALCOHOL)) return false;
-    if (
-      dish.some((d) =>
-        ["drink", "beverage", "cocktail", "dessert"].includes(d)
-      )
-    )
-      return false;
+    if (Array.from(DESSERT).some((w) => title.includes(w))) return false;
+    if (Array.from(DRINK).some((w) => title.includes(w))) return false;
+    if (Array.from(ALCOHOL).some((w) => title.includes(w))) return false;
+    if (dish.some((d) => ["drink", "beverage", "cocktail", "dessert"].includes(d))) return false;
 
     const used = it.usedIngredientCount ?? 0;
     const time = it.readyInMinutes ?? 999;
     if (used < 2) return false;
     if (time > timeCap) return false;
 
-    // specific overlap
-    const matchSpecificCount = specific.filter((sp) =>
-      ingNames.some((n) => n.includes(sp))
-    ).length;
-    if (specific.length >= 3 && matchSpecificCount < 2) return false;
-
-    // no fish dishes if we don't have fish
-    if (
-      /shrimp|prawn|salmon|tuna|anchovy|sardine/.test(title) &&
-      !pantry.some((p) =>
-        ["shrimp", "prawn", "salmon", "tuna", "fish"].includes(p)
-      )
-    ) {
-      return false;
+    if (specific.length >= 2) {
+      const ingNames = (it.extendedIngredients || []).map((ing) =>
+        String(ing.name || "").toLowerCase()
+      );
+      const ok = specific.some((sp) =>
+        ingNames.some((n) => n.includes(sp))
+      );
+      if (!ok) return false;
     }
 
-    // main word guard
-    const titleWords = title.split(/[^a-z]+/g).filter(Boolean);
-    for (const w of MAIN_WORDS) {
-      if (titleWords.includes(w)) {
-        const hasMain = [...pantrySet].some((p) => p.includes(w));
-        if (!hasMain) return false;
+    if (/shrimp|prawn|salmon|tuna|anchovy|sardine/.test(title)) {
+      if (!pantry.some((p) => ["shrimp", "prawn", "salmon", "tuna", "fish"].includes(p))) {
+        return false;
       }
     }
 
-    // hit / missing / shopping list
-    let hit = 0;
-    let missing = 0;
-    const missingList = [];
-
-    for (const rawName of ingNames) {
-      const simple = rawName.replace(/[^a-z ]/g, "").trim();
-      if (!simple) continue;
-
-      const inPantry = [...pantrySet].some((p) => simple.includes(p));
-      const isStaple = [...staplesSet].some((p) => simple.includes(p));
-
-      if (inPantry) {
-        hit++;
-      } else if (isStaple) {
-        // ignore
-      } else {
-        missing++;
-        missingList.push(simple);
-      }
-    }
-
-    // relaxed guard: max 2 missing, majority hit
-    if (missing > 2) return false;
-    if (hit < 2) return false;
-    if (hit + missing > 0 && hit / (hit + missing) < 0.6) return false;
-
-    it._dsMissing = missingList;
     return true;
   });
 
@@ -559,13 +467,6 @@ async function spoonacularRecipes(pantry, prefs) {
       0.7 * (used / (used + missed + 1)) +
       0.3 * (1 - Math.min(time, 60) / 60);
 
-    const ingObjs = (it.extendedIngredients || []).map((ing) => {
-      const nm = String(ing.name || "").toLowerCase();
-      return { name: nm, have: pantry.includes(nm) };
-    });
-
-    const missingList = Array.isArray(it._dsMissing) ? it._dsMissing : [];
-
     return {
       id: String(it.id),
       title: it.title,
@@ -573,13 +474,15 @@ async function spoonacularRecipes(pantry, prefs) {
       energy: "hob",
       cost: 2.5,
       score: Math.round(score * 100) / 100,
-      ingredients: ingObjs,
+      ingredients: (it.extendedIngredients || []).map((ing) => {
+        const nm = String(ing.name || "").toLowerCase();
+        return { name: nm, have: pantry.includes(nm) };
+      }),
       steps: (it.analyzedInstructions?.[0]?.steps || []).map((s, i) => ({
         id: `${it.id}-s${i}`,
         text: s.step,
       })),
       badges: ["web"],
-      shoppingList: missingList,
     };
   });
 
@@ -594,35 +497,46 @@ async function spoonacularRecipes(pantry, prefs) {
   };
 }
 
-/* ----------------------- LLM (minimal for now) ----------------------- */
+/* ----------------------- LLM ----------------------- */
 async function llmRecipes(pantry, prefs) {
-  if (!OPENAI_API_KEY)
+  if (!OPENAI_API_KEY) {
     return { recipes: [], info: { reason: "no OPENAI_API_KEY" } };
+  }
 
+  const pantryText = pantry.join(", ");
   const body = {
     model: "gpt-4o-mini",
-    temperature: 0.4,
+    temperature: 0.45,
     max_tokens: 700,
-    response_format: { type: "json_object" },
     messages: [
       {
         role: "system",
         content:
-          "You are DinnerSnap, a world-class savoury dinner chef. You ONLY create realistic DINNER recipes using the given pantry ingredients plus basic staples like water, oil, salt and pepper.",
+          "You are DinnerSnap, an expert home cook. You ONLY return valid JSON. Use ONLY the pantry items and at most 2 extra ingredients.",
       },
       {
         role: "user",
         content:
-          `Given this pantry: ${pantry.join(
-            ", "
-          )}, create 1–2 DINNER recipes as a JSON object with this shape:\n` +
-          `{\n  "recipes": [\n    {\n      "id": "string",\n      "title": "string",\n      "time": 10–60,\n      "cost": 1–5,\n      "energy": "hob" | "oven" | "air fryer",\n      "ingredients": [{ "name": "string" }],\n      "steps": [{ "id": "string", "text": "string" }]\n    }\n  ]\n}\n\n` +
-          "Use ONLY the pantry ingredients plus universal basics. Do NOT invent totally new ingredients.",
+          `Given this pantry: [${pantryText}]\n` +
+          "Return ONE savoury DINNER recipe as pure JSON with this exact schema:\n" +
+          "{\n" +
+          '  "id": "string",\n' +
+          '  "title": "string",\n' +
+          '  "time": number,\n' +
+          '  "cost": number,\n' +
+          '  "energy": "hob" | "oven" | "air fryer",\n' +
+          '  "ingredients": [ { "name": "string", "have": boolean } ],\n' +
+          '  "steps": [ { "id": "string", "text": "string" } ],\n' +
+          '  "shoppingList": [ "string" ]\n' +
+          "}\n" +
+          "No prose. No markdown. JSON only.",
       },
     ],
   };
 
+  let j;
   try {
+    const timeoutMs = 11000;
     const r = await tfetch(
       "https://api.openai.com/v1/chat/completions",
       {
@@ -633,333 +547,285 @@ async function llmRecipes(pantry, prefs) {
         },
         body: JSON.stringify(body),
       },
-      11000,
+      timeoutMs,
       "llm-timeout"
     );
-
-    const j = await r.json();
-
-    if (j?.error) {
-      console.log("LLM API error:", j.error);
-      return { recipes: [], info: { error: j.error.message || "openai-error" } };
-    }
-
-    const raw = j?.choices?.[0]?.message?.content;
-    if (!raw) {
-      console.log("LLM empty content:", j);
-      return { recipes: [], info: { error: "no-content" } };
-    }
-
-    let parsed;
-    try {
-      parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-    } catch (e) {
-      console.log("LLM JSON parse error:", e, "raw:", raw);
-      return { recipes: [], info: { error: "json-parse-error" } };
-    }
-
-    const list = Array.isArray(parsed.recipes) ? parsed.recipes : [];
-    const cleaned = list.map((rec, idx) => {
-      const id = rec.id || `llm-${Date.now()}-${idx}`;
-      return {
-        id,
-        title: rec.title || "LLM recipe",
-        time: rec.time ?? 20,
-        cost: rec.cost ?? 2,
-        energy: rec.energy || "hob",
-        ingredients: (rec.ingredients || []).map((i) => {
-          const nm = String(i.name || "").toLowerCase();
-          return { name: nm, have: pantry.includes(nm) };
-        }),
-        steps: (rec.steps || []).map((s, i) => ({
-          id: s.id || `${id}-s${i}`,
-          text: s.text || String(s),
-        })),
-        badges: ["llm"],
-      };
-    });
-
-    return { recipes: cleaned, info: { ok: true } };
+    j = await r.json().catch(() => ({}));
   } catch (e) {
-    console.log("LLM fetch error:", String(e?.message || e));
+    console.log("LLM fetch error:", e?.message || e);
     return { recipes: [], info: { error: String(e?.message || e) } };
   }
+
+  if (j?.error) {
+    console.log("LLM API error:", j.error);
+    return { recipes: [], info: { error: j.error.message || "openai-error" } };
+  }
+
+  const raw = j?.choices?.[0]?.message?.content;
+  if (!raw || typeof raw !== "string") {
+    console.log("LLM empty content:", j);
+    return { recipes: [], info: { error: "no content" } };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.trim());
+  } catch (e) {
+    console.log("LLM JSON parse failed:", e?.message || e, "raw:", raw.slice(0, 120));
+    return { recipes: [], info: { error: "json-parse-failed" } };
+  }
+
+  const recipes = [];
+  const base = parsed && typeof parsed === "object" ? parsed : {};
+
+  const id = String(base.id || `llm-${Date.now()}`);
+  const title = String(base.title || "Pantry Dinner");
+  const time = Number.isFinite(base.time) ? base.time : 25;
+  const cost = Number.isFinite(base.cost) ? base.cost : 2.0;
+  const energy = base.energy || "hob";
+
+  const ingredients = Array.isArray(base.ingredients)
+    ? base.ingredients.map((i) => {
+        const nm = String(i.name || "").toLowerCase();
+        return {
+          name: nm,
+          have: Boolean(
+            i.have || pantry.includes(nm)
+          ),
+        };
+      })
+    : pantry.map((p) => ({ name: p, have: true }));
+
+  const steps = Array.isArray(base.steps)
+    ? base.steps.map((s, i) => ({
+        id: s.id || `step-${i}`,
+        text: s.text || String(s),
+      }))
+    : [
+        { id: "step-1", text: "Combine your pantry ingredients in a pan." },
+        { id: "step-2", text: "Cook until hot and seasoned to taste." },
+      ];
+
+  const shoppingList = Array.isArray(base.shoppingList)
+    ? base.shoppingList.map((x) => String(x))
+    : [];
+
+  recipes.push({
+    id,
+    title,
+    time,
+    cost,
+    energy,
+    ingredients,
+    steps,
+    badges: ["llm"],
+    shoppingList,
+  });
+
+  return { recipes, info: { ok: true } };
 }
 
-/* ----------------------- Emergency fallback ----------------------- */
+/* ----------------------- Emergency ----------------------- */
 function emergencyRecipe(pantry) {
-  const pantrySet = new Set(pantry);
-
   const titleBits = [];
   if (pantry.some((p) => p.includes("chickpea"))) titleBits.push("Chickpea");
-  if (
-    pantry.includes("coconut cream") ||
-    pantry.includes("coconut milk")
-  )
-    titleBits.push("Coconut");
-  if (pantry.some((p) => PASTA.has(p))) titleBits.push("Spaghetti");
-  const title =
-    (titleBits.length ? titleBits.join(" ") : "Pantry") + " Savoury Skillet";
+  if (pantry.includes("coconut milk")) titleBits.push("Coconut");
+  if (pantry.some((p) => p.includes("pasta") || p.includes("spaghetti"))) titleBits.push("Pasta");
+  const title = (titleBits.length ? titleBits.join(" ") : "Pantry") + " Savoury Skillet";
 
-  const baseIngs = [];
-
-  if (!pantrySet.has("onion")) {
-    baseIngs.push({
-      name: "onion (or onion powder)",
-      have: pantrySet.has("onion"),
-    });
-  }
-  if (!pantrySet.has("garlic")) {
-    baseIngs.push({
-      name: "garlic (or garlic powder)",
-      have: pantrySet.has("garlic"),
-    });
-  }
-  if (!pantrySet.has("ginger")) {
-    baseIngs.push({
-      name: "ginger (or ground ginger)",
-      have: pantrySet.has("ginger"),
-    });
-  }
-  if (!pantrySet.has("mixed dried herbs")) {
-    baseIngs.push({
-      name: "mixed dried herbs",
-      have: pantrySet.has("mixed dried herbs"),
-    });
-  }
-  if (!pantrySet.has("stock cube")) {
-    baseIngs.push({
-      name: "stock cube",
-      have: pantrySet.has("stock cube"),
-    });
-  }
-  if (!pantrySet.has("lemon") && !pantrySet.has("vinegar")) {
-    baseIngs.push({
+  const baseIngs = [
+    { name: "onion (or onion powder)", have: pantry.includes("onion") },
+    { name: "garlic (or garlic powder)", have: pantry.includes("garlic") },
+    { name: "ginger (or ground ginger)", have: pantry.includes("ginger") },
+    { name: "mixed dried herbs", have: pantry.includes("mixed dried herbs") },
+    { name: "stock cube", have: pantry.includes("stock cube") },
+    {
       name: "lemon or vinegar",
-      have: pantrySet.has("lemon") || pantrySet.has("vinegar"),
-    });
-  }
-  if (!pantrySet.has("salt") && !pantrySet.has("pepper")) {
-    baseIngs.push({
+      have: pantry.includes("lemon") || pantry.includes("vinegar"),
+    },
+    {
       name: "salt & black pepper",
-      have:
-        pantrySet.has("salt") ||
-        pantrySet.has("black pepper") ||
-        pantrySet.has("pepper"),
-    });
-  }
-
+      have: pantry.includes("salt") || pantry.includes("black pepper"),
+    },
+  ];
   const uniqPantry = pantry.map((p) => ({ name: p, have: true }));
-  const combined = [...uniqPantry, ...baseIngs];
-
-  const seen = new Set();
-  const ingredients = [];
-  for (const ing of combined) {
-    const nm = ing.name.toLowerCase();
-    if (seen.has(nm)) continue;
-    seen.add(nm);
-    ingredients.push(ing);
-  }
-
-  const sample = pantry.slice(0, 4).join(", ") || "your pantry items";
-
   return {
-    id: "local-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+    id: `local-${Date.now()}`,
     title,
     time: 15,
     cost: 2.0,
     energy: "hob",
-    ingredients,
+    ingredients: [...uniqPantry, ...baseIngs],
     steps: [
-      {
-        id: "s1",
-        text: "Heat oil; add onion, garlic & ginger. Cook 2–3 min.",
-      },
-      {
-        id: "s2",
-        text: `Add your selected pantry ingredients (e.g. ${sample}) and simmer 6–8 min.`,
-      },
+      { id: "s1", text: "Heat oil; add onion, garlic & ginger. Cook 2–3 min." },
+      { id: "s2", text: "Add pantry items and simmer 6–8 min." },
     ],
     badges: ["local"],
   };
 }
 
-/* ----------------------- Handler ----------------------- */
-export default async function handler(req) {
-  const t0 = nowMs();
-  if (req.method !== "POST") return json(405, { error: "POST only" });
+/* ----------------------- Core analyze logic ----------------------- */
+async function runAnalyze({ imageBase64, pantryOverride, prefs = {}, mode }) {
+  const tStart = nowMs();
+  let pantry = [];
+  let source = "";
+  let pantryFrom = {};
 
-  // --- SAFE BODY PARSE (NODE REQUEST) WITH TIMEOUT + SIZE GUARD ---
-  let rawBody;
-try {
-  rawBody = await readBodyNode(req, {
-    timeoutMs: 3000,
-    maxLength: 3_500_000, // ~2.6 MB binary when base64
-  });
-} catch (e) {
-  const msg = String(e?.message || e);
-  console.log("body parse error:", msg);
-  const fallback = emergencyRecipe([]);
-  return json(200, {
-    pantry: [],
-    recipes: [fallback],
-    debug: { source: "body-parse-fail", error: msg },
-  });
-}
-
-let body;
-try {
-  body = rawBody ? JSON.parse(rawBody) : {};
-} catch (e) {
-  const msg = String(e?.message || e);
-  console.log("JSON parse error:", msg);
-  const fallback = emergencyRecipe([]);
-  return json(200, {
-    pantry: [],
-    recipes: [fallback],
-    debug: { source: "json-parse-fail", error: msg },
-  });
-}
-
-  const { imageBase64, pantryOverride, prefs = {} } = body || {};
-  const watchdogMs = 19000;
-
-  const main = async () => {
-    const tStart = nowMs();
-    let pantry = [];
-    let source = "";
-    let pantryFrom = {};
-
-    if (Array.isArray(pantryOverride) && pantryOverride.length) {
-      pantry = cleanPantry(pantryOverride);
-      source = "pantryOverride";
-    } else if (imageBase64) {
-      try {
-        const v0 = nowMs();
-        const visRes = await withTimeout(
-          () => callVision(imageBase64),
-          2500,
-          "vision-timeout"
-        );
-
-        pantryFrom = {
-          ocr: visRes.ocrTokens,
-          labels: visRes.labels,
-          objects: visRes.objects,
-        };
-
-        const rawTokens = [
-          ...(visRes.ocrTokens || []),
-          ...(visRes.labels || []),
-          ...(visRes.objects || []),
-        ];
-        const seasoningSafe = stripMeatWhenSeasoning(rawTokens);
-        const withCombos = addPhraseCombos(seasoningSafe);
-        pantry = cleanPantry(withCombos);
-        source = "vision";
-        console.log("vision ok in", nowMs() - v0, "ms pantry=", pantry);
-      } catch (e) {
-        source = "vision-failed";
-        pantryFrom = { error: String(e?.message || e) };
-        pantry = [];
-      }
-    } else {
-      return json(400, { error: "imageBase64 required (or pantryOverride)" });
-    }
-
-    if (prefs?.pantryOnly) {
-      const debug = {
-        source,
-        pantryFrom,
-        cleanedPantry: pantry,
-        usedLLM: false,
-        totalMs: nowMs() - tStart,
-        mode: "pantryOnly",
-      };
-      console.log("analyze pantryOnly debug:", debug);
-      return json(200, { pantry, recipes: [], debug });
-    }
-
-    const spoonP = (async () => {
-      const s0 = nowMs();
-      const sp = await spoonacularRecipes(pantry, prefs);
-      console.log(
-        "spoon end in",
-        nowMs() - s0,
-        "ms kept=",
-        sp.info?.kept,
-        "fallback=",
-        sp.info?.usedFallback
-      );
-      return sp.results || [];
-    })();
-
-    const llmP = (async () => {
-      const l0 = nowMs();
-      const llm = await llmRecipes(pantry, prefs);
-      console.log(
-        "llm end in",
-        nowMs() - l0,
-        "ms count=",
-        (llm.recipes || []).length,
-        "info=",
-        llm.info
-      );
-      return llm.recipes || [];
-    })();
-
-    let spoonList = [];
-    let llmList = [];
+  // Pantry from override (manual + essentials)
+  if (Array.isArray(pantryOverride) && pantryOverride.length) {
+    pantry = cleanPantry(pantryOverride);
+    source = "pantryOverride";
+  } else if (imageBase64) {
+    // Vision path
     try {
-      [spoonList, llmList] = await Promise.all([
-        spoonP.catch(() => []),
-        llmP.catch(() => []),
-      ]);
-    } catch {
-      // ignore, handled above
+      const v0 = nowMs();
+      const visRes = await callVision(imageBase64);
+      pantryFrom = {
+        ocr: visRes.ocrTokens,
+        labels: visRes.labels,
+        objects: visRes.objects,
+      };
+      const rawTokens = [
+        ...(visRes.ocrTokens || []),
+        ...(visRes.labels || []),
+        ...(visRes.objects || []),
+      ];
+      pantry = cleanPantry(rawTokens);
+      source = "vision";
+      console.log("vision ok in", nowMs() - v0, "ms pantry=", pantry);
+    } catch (e) {
+      source = "vision-failed";
+      pantryFrom = { error: String(e?.message || e) };
+      pantry = [];
     }
+  } else {
+    // nothing to analyze
+    return {
+      pantry: [],
+      recipes: [],
+      debug: { source: "no-input", totalMs: nowMs() - tStart },
+    };
+  }
 
-    let combined = [];
-    if (spoonList.length) combined = spoonList;
-
-    if (llmList.length) {
-      for (const rec of llmList) {
-        if (!combined.find((r) => r.id === rec.id)) {
-          combined.push(rec);
-        }
-      }
-    }
-
-    if (!combined.length) {
-      combined = [emergencyRecipe(pantry)];
-    }
-
-    if (combined.length > 3) combined = combined.slice(0, 3);
-
+  // Pantry-only fast path
+  if (mode === "pantryOnly" || prefs?.pantryOnly) {
     const debug = {
       source,
       pantryFrom,
       cleanedPantry: pantry,
-      usedLLM: combined.some(
-        (r) => Array.isArray(r.badges) && r.badges.includes("llm")
-      ),
+      usedLLM: false,
       totalMs: nowMs() - tStart,
+      mode: "pantryOnly",
     };
-    console.log("analyze debug:", debug);
+    console.log("analyze pantryOnly debug:", debug);
+    return { pantry, recipes: [], debug };
+  }
 
-    return json(200, { pantry, recipes: combined, debug });
+  // Full providers
+  const spoonP = (async () => {
+    const s0 = nowMs();
+    const sp = await spoonacularRecipes(pantry, prefs);
+    console.log(
+      "spoon end in",
+      nowMs() - s0,
+      "ms kept=",
+      sp.info?.kept,
+      "fallback=",
+      sp.info?.usedFallback
+    );
+    return sp.results || [];
+  })();
+
+  const llmP = (async () => {
+    const l0 = nowMs();
+    const llm = await llmRecipes(pantry, prefs);
+    console.log(
+      "llm end in",
+      nowMs() - l0,
+      "ms count=",
+      (llm.recipes || []).length,
+      "info=",
+      llm.info
+    );
+    return llm.recipes || [];
+  })();
+
+  let spoonList = [];
+  let llmList = [];
+  try {
+    const settled = await Promise.allSettled([spoonP, llmP]);
+    if (settled[0].status === "fulfilled") spoonList = settled[0].value || [];
+    if (settled[1].status === "fulfilled") llmList = settled[1].value || [];
+  } catch (e) {
+    console.log("provider join error:", e?.message || e);
+  }
+
+  let combined = [];
+  if (spoonList.length) combined = spoonList;
+  if (combined.length < 3 && llmList.length) {
+    for (const rec of llmList) {
+      if (!combined.find((r) => r.id === rec.id)) {
+        combined.push(rec);
+        if (combined.length >= 3) break;
+      }
+    }
+  }
+  if (!combined.length) combined = [emergencyRecipe(pantry)];
+  else if (combined.length > 3) combined = combined.slice(0, 3);
+
+  const debug = {
+    source,
+    pantryFrom,
+    cleanedPantry: pantry,
+    usedLLM: combined.some(
+      (r) => Array.isArray(r.badges) && r.badges.includes("llm")
+    ),
+    totalMs: nowMs() - tStart,
   };
+  console.log("analyze debug:", debug);
+  return { pantry, recipes: combined, debug };
+}
+
+/* ----------------------- Handler ----------------------- */
+export default async function handler(req, res) {
+  const t0 = nowMs();
+
+  if (req.method !== "POST") {
+    return sendJson(res, 405, { error: "POST only" });
+  }
+
+  let body;
+  try {
+    body = await readJsonBody(req, 3000);
+  } catch (e) {
+    console.log("body parse error:", e?.message || e);
+    if (e.code === "PAYLOAD_TOO_LARGE") {
+      return sendJson(res, 413, { error: "payload-too-large" });
+    }
+    if (e.code === "INVALID_JSON") {
+      return sendJson(res, 400, { error: "invalid-json" });
+    }
+    return sendJson(res, 408, { error: "body-timeout" });
+  }
+
+  const { imageBase64, pantryOverride, prefs = {}, mode } = body || {};
+  const watchdogMs = 12000;
 
   try {
-    const out = await withTimeout(() => main(), watchdogMs, "watchdog");
+    const out = await withTimeout(
+      () => runAnalyze({ imageBase64, pantryOverride, prefs, mode }),
+      watchdogMs,
+      "watchdog"
+    );
     console.log("handler total=", nowMs() - t0, "ms");
-    return out;
+    return sendJson(res, 200, out);
   } catch (e) {
     console.log("watchdog fired:", String(e?.message || e));
-    return json(200, {
+    const fallback = {
       pantry: [],
       recipes: [emergencyRecipe([])],
       debug: { source: "watchdog", error: String(e?.message || e) },
-    });
+    };
+    return sendJson(res, 200, fallback);
   }
 }
