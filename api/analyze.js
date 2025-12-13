@@ -373,13 +373,40 @@ function nearestWhitelistStrict(term) {
 }
 
 function cleanPantry(raw) {
+  const tokens = uniqLower(raw);
+  const tokenSet = new Set(tokens);
+
   const out = new Set();
-  for (const t0 of uniqLower(raw)) {
+
+  // --- Combo heuristics for multi-word items ---
+  // coconut + milk => coconut milk
+  if (tokenSet.has("coconut") && tokenSet.has("milk")) {
+    out.add("coconut milk");
+  }
+
+  // egg + noodles => egg noodles
+  if (tokenSet.has("egg") && tokenSet.has("noodles")) {
+    out.add("egg noodles");
+  }
+
+  // You can add more combos here later if you like:
+  // if (tokenSet.has("beef") && tokenSet.has("seasoning")) { ... }
+
+  // --- Normal whitelist + fuzzy matching ---
+  for (const t0 of tokens) {
     const t = MAP[t0] || t0;
+
+    // Skip tokens we already upgraded into combos
+    if (t === "coconut" && out.has("coconut milk")) continue;
+    if (t === "milk" && out.has("coconut milk")) continue;
+    if (t === "egg" && out.has("egg noodles")) continue;
+    if (t === "noodles" && out.has("egg noodles")) continue;
+
     if (WHITELIST.includes(t)) {
       out.add(t);
       continue;
     }
+
     if (t.length >= 5) {
       const near = nearestWhitelistStrict(t);
       if (near) {
@@ -388,9 +415,9 @@ function cleanPantry(raw) {
       }
     }
   }
+
   return [...out];
 }
-
 /* ----------------------- Spoonacular ----------------------- */
 async function spoonacularRecipes(pantry, prefs) {
   if (!SPOON_KEY) return { results: [], info: { note: "no SPOON_KEY" } };
@@ -721,7 +748,11 @@ async function runAnalyze({ imageBase64, pantryOverride, prefs = {}, mode }) {
     return { pantry, recipes: [], debug };
   }
 
-  // Full providers
+
+
+
+
+ // ---- Full providers ----
   const spoonP = (async () => {
     const s0 = nowMs();
     const sp = await spoonacularRecipes(pantry, prefs);
@@ -752,6 +783,7 @@ async function runAnalyze({ imageBase64, pantryOverride, prefs = {}, mode }) {
 
   let spoonList = [];
   let llmList = [];
+
   try {
     const settled = await Promise.allSettled([spoonP, llmP]);
     if (settled[0].status === "fulfilled") spoonList = settled[0].value || [];
@@ -760,28 +792,44 @@ async function runAnalyze({ imageBase64, pantryOverride, prefs = {}, mode }) {
     console.log("provider join error:", e?.message || e);
   }
 
-  let combined = [];
-  if (spoonList.length) combined = spoonList;
-  if (combined.length < 3 && llmList.length) {
-    for (const rec of llmList) {
-      if (!combined.find((r) => r.id === rec.id)) {
-        combined.push(rec);
-        if (combined.length >= 3) break;
-      }
-    }
-  }
-  if (!combined.length) combined = [emergencyRecipe(pantry)];
-  else if (combined.length > 3) combined = combined.slice(0, 3);
+let combined = [];
+
+// 1) If LLM produced anything, make that the "best match"
+if (llmList.length) {
+  combined.push(llmList[0]); // top card
+}
+
+// 2) Fill remaining slots with Spoonacular as alternatives (avoid duplicates)
+for (const rec of spoonList) {
+  if (combined.length >= 3) break;
+
+  const dup = combined.some(
+    (r) => String(r.id || "").toLowerCase() === String(rec.id || "").toLowerCase()
+  );
+  if (!dup) combined.push(rec);
+}
+
+// 3) If still empty, fall back to emergency
+if (!combined.length) {
+  combined = [emergencyRecipe(pantry)];
+}
+
+
+const usedLLM = combined.some(
+  (r) => Array.isArray(r.badges) && r.badges.includes("llm")
+);
+
+
 
   const debug = {
     source,
     pantryFrom,
     cleanedPantry: pantry,
-    usedLLM: combined.some(
-      (r) => Array.isArray(r.badges) && r.badges.includes("llm")
-    ),
+    usedLLM,
     totalMs: nowMs() - tStart,
+
   };
+
   console.log("analyze debug:", debug);
   return { pantry, recipes: combined, debug };
 }
